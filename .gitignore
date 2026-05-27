@@ -1,0 +1,14 @@
+# Python build artifacts
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+
+# makepkg artifacts
+pkg/
+src/
+*.pkg.tar.zst
+
+# Editor
+.idea/

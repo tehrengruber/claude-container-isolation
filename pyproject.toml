@@ -1,0 +1,20 @@
+[project]
+name = "claude-isol"
+version = "0.1.0"
+description = "Run Claude Code in an isolated podman container with an MCP-filtering proxy"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["websockets"]
+
+[project.scripts]
+claude-isol = "claude_isol.claude_isol:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["claude_isol*"]
+
+[tool.setuptools.package-data]
+claude_isol = ["Dockerfile"]

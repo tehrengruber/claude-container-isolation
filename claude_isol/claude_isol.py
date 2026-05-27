@@ -73,7 +73,7 @@ def spawn_proxy(ide_port: str) -> str:
             set_parent_death_signal(signal.SIGTERM)
             os.execv(sys.executable, [
                 sys.executable,
-                str(SCRIPT_DIR / "mcp-proxy.py"),
+                str(SCRIPT_DIR / "mcp_proxy.py"),
                 "--upstream", f"ws://127.0.0.1:{ide_port}",
             ])
         except BaseException as e:
