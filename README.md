@@ -61,6 +61,7 @@ claude-isol [claude args...]        # run Claude Code
 claude-isol --shell                 # drop into bash inside the container
                                     # (handy for `gh auth login` etc.)
 claude-isol --image NAME [args...]  # run a prebuilt image as-is
+claude-isol -v /data:/data [args]   # add extra mounts (repeatable)
 ```
 
 With no `--image`, `claude-isolation:latest` is used and built from the
