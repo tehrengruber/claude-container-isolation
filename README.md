@@ -3,6 +3,10 @@
 Run [Claude Code](https://claude.com/claude-code) inside an isolated podman
 container, with an MCP-filtering proxy in front of the JetBrains IDE link.
 
+> **Disclaimer:** This is an unofficial, community project. It is not
+> affiliated with, endorsed by, or supported by Anthropic. "Claude" and
+> "Claude Code" are trademarks of Anthropic. Use at your own risk.
+
 ## What it does
 
 - Launches Claude Code in an Arch Linux container, mounting only the current
