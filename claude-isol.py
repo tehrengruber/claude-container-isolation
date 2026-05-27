@@ -93,6 +93,8 @@ def spawn_proxy(ide_port: str) -> str:
 def main() -> int:
     args = sys.argv[1:]
     drop_shell = False
+    # --shell drops into bash inside the container instead of running claude,
+    # useful for one-off setup like `gh auth login`.
     if args and args[0] == "--shell":
         drop_shell = True
         args = args[1:]
