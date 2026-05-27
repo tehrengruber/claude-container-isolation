@@ -57,10 +57,13 @@ sudo pacman -U claude-isol-*.pkg.tar.zst
 ## Usage
 
 ```sh
-claude-isol [claude args...]    # run Claude Code
-claude-isol --shell              # drop into bash inside the container
-                                 # (handy for `gh auth login` etc.)
+claude-isol [claude args...]        # run Claude Code
+claude-isol --shell                 # drop into bash inside the container
+                                    # (handy for `gh auth login` etc.)
+claude-isol --image NAME [args...]  # run a prebuilt image as-is
 ```
 
-The image is built on first run if it's not already present. Override the
-image tag with `CLAUDE_ISO_IMAGE`.
+With no `--image`, `claude-isolation:latest` is used and built from the
+bundled Dockerfile on first run if it isn't present (override the default
+tag with `CLAUDE_ISO_IMAGE`). With `--image NAME`, that image is run as-is
+and never built — bring your own.

@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-IMAGE = os.environ.get("CLAUDE_ISO_IMAGE", "claude-isolation:latest")
+DEFAULT_IMAGE = os.environ.get("CLAUDE_ISO_IMAGE", "claude-isolation:latest")
 HOME = Path(os.environ["HOME"])
 
 PR_SET_PDEATHSIG = 1
@@ -50,11 +50,11 @@ def find_ide_lock(cwd: Path) -> Optional[Path]:
     return None
 
 
-def ensure_image() -> None:
-    if subprocess.run(["podman", "image", "exists", IMAGE]).returncode == 0:
+def ensure_image(image: str) -> None:
+    if subprocess.run(["podman", "image", "exists", image]).returncode == 0:
         return
-    print(f"image {IMAGE} not found; building from {SCRIPT_DIR}", file=sys.stderr)
-    subprocess.run(["podman", "build", "-t", IMAGE, str(SCRIPT_DIR)], check=True)
+    print(f"image {image} not found; building from {SCRIPT_DIR}", file=sys.stderr)
+    subprocess.run(["podman", "build", "-t", image, str(SCRIPT_DIR)], check=True)
 
 
 def spawn_proxy(ide_port: str) -> str:
@@ -93,13 +93,27 @@ def spawn_proxy(ide_port: str) -> str:
 def main() -> int:
     args = sys.argv[1:]
     drop_shell = False
-    # --shell drops into bash inside the container instead of running claude,
-    # useful for one-off setup like `gh auth login`.
-    if args and args[0] == "--shell":
-        drop_shell = True
-        args = args[1:]
+    image: Optional[str] = None
+    # Leading flags are consumed here; the rest is forwarded to claude.
+    #   --shell      drop into bash instead of running claude (e.g. `gh auth login`)
+    #   --image NAME run the prebuilt image NAME as-is, instead of the bundled default
+    while args:
+        if args[0] == "--shell":
+            drop_shell = True
+            args = args[1:]
+        elif args[0] == "--image":
+            if len(args) < 2:
+                print("--image requires an argument", file=sys.stderr)
+                return 2
+            image, args = args[1], args[2:]
+        else:
+            break
 
-    ensure_image()
+    if image is None:
+        # No image specified: use the bundled default, building it on demand.
+        image = DEFAULT_IMAGE
+        ensure_image(image)
+
     cwd = Path.cwd()
     ide_lock = None if drop_shell else find_ide_lock(cwd)
 
@@ -135,7 +149,7 @@ def main() -> int:
         "-w", str(cwd),
         "-e", f"HOME={HOME}",
         "-e", "TERM",
-        IMAGE,
+        image,
         *(["bash"] if drop_shell else ["claude", *args]),
     ]
 
