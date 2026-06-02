@@ -6,7 +6,7 @@ pkgrel=1
 pkgdesc="Run Claude Code inside an isolated podman container with an MCP-filtering proxy"
 arch=('any')
 license=('custom')
-depends=('podman' 'python' 'python-websockets')
+depends=('podman' 'python' 'python-websockets' 'glib2')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=()
 sha256sums=()
@@ -20,4 +20,6 @@ build() {
 package() {
     cd "$startdir"
     python -m installer --destdir="$pkgdir" dist/*.whl
+    install -Dm644 claude_isol/claude-isol-notifyd.service \
+        "$pkgdir/usr/lib/systemd/user/claude-isol-notifyd.service"
 }

@@ -18,12 +18,20 @@ import signal
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGE = os.environ.get("CLAUDE_ISO_IMAGE", "claude-isolation:latest")
 HOME = Path(os.environ["HOME"])
+
+# Host-notification wiring (see notifyd.py / notify_client.py). The forwarder and
+# socket are mounted at fixed container paths; the daemon's socket lives under
+# the host's XDG runtime dir.
+NOTIFY_SOCK_CONTAINER = "/run/claude-isol-notify.sock"
+NOTIFY_CLIENT_CONTAINER = "/opt/claude-isol/notify_client.py"
+NOTIFY_CLIENT_SRC = SCRIPT_DIR / "notify_client.py"
 
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
@@ -48,6 +56,49 @@ def find_ide_lock(cwd: Path) -> Optional[Path]:
             if cwd == f or f in cwd.parents:
                 return lock
     return None
+
+
+def notify_hooks_settings() -> dict:
+    """Hook config injected via `claude --settings` so the in-container session
+    reports its state to the host daemon. Every event runs the same forwarder;
+    `async` keeps it off the critical path."""
+    cmd = f"python3 {NOTIFY_CLIENT_CONTAINER}"
+
+    def hook(matcher: Optional[str] = None) -> list:
+        spec = {"hooks": [{"type": "command", "command": cmd, "async": True}]}
+        if matcher is not None:
+            spec["matcher"] = matcher
+        return [spec]
+
+    return {
+        "hooks": {
+            "SessionStart": hook(),
+            "UserPromptSubmit": hook(),
+            "PreToolUse": hook("*"),
+            "Notification": hook(),
+            "Stop": hook(),
+            "SessionEnd": hook(),
+        }
+    }
+
+
+def notify_wiring() -> tuple[list[str], list[str], list[str]]:
+    """Return (podman_mounts, podman_env, claude_args) for host notifications,
+    or empty lists when the notifyd socket isn't present (daemon not running)."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    sock = Path(runtime) / "claude-isol" / "notify.sock"
+    if not sock.is_socket():
+        return [], [], []
+    mounts = [
+        "-v", f"{sock}:{NOTIFY_SOCK_CONTAINER}",
+        "-v", f"{NOTIFY_CLIENT_SRC}:{NOTIFY_CLIENT_CONTAINER}:ro",
+    ]
+    env = [
+        "-e", f"CLAUDE_ISOL_NOTIFY_SOCK={NOTIFY_SOCK_CONTAINER}",
+        "-e", f"CLAUDE_ISOL_INSTANCE={uuid.uuid4().hex}",
+    ]
+    claude_args = ["--settings", json.dumps(notify_hooks_settings())]
+    return mounts, env, claude_args
 
 
 def ensure_image(image: str) -> None:
@@ -141,6 +192,12 @@ def main() -> int:
     gitconfig = HOME / ".gitconfig-claude"
     gitconfig.touch(exist_ok=True)
 
+    notify_mounts: list[str] = []
+    notify_env: list[str] = []
+    notify_args: list[str] = []
+    if not drop_shell:
+        notify_mounts, notify_env, notify_args = notify_wiring()
+
     tty_flag = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
 
     cmd = [
@@ -155,11 +212,13 @@ def main() -> int:
         "-v", f"{gitconfig}:{HOME}/.gitconfig",
         "-v", f"{cwd}:{cwd}",
         *volume_args,
+        *notify_mounts,
         "-w", str(cwd),
         "-e", f"HOME={HOME}",
         "-e", "TERM",
+        *notify_env,
         image,
-        *(["bash"] if drop_shell else ["claude", *args]),
+        *(["bash"] if drop_shell else ["claude", *notify_args, *args]),
     ]
 
     os.execvp("podman", cmd)
