@@ -145,10 +145,12 @@ def main() -> int:
     args = sys.argv[1:]
     drop_shell = False
     image: Optional[str] = None
+    no_userns = False
     volume_args: list[str] = []
     # Leading flags are consumed here; the rest is forwarded to claude.
     #   --shell        drop into bash instead of running claude (e.g. `gh auth login`)
     #   --image NAME   run the prebuilt image NAME as-is, instead of the bundled default
+    #   --no-userns    omit --userns entirely (use podman's own default)
     #   -v/--volume V  extra mount, passed straight to `podman run -v` (repeatable)
     while args:
         if args[0] == "--shell":
@@ -159,6 +161,8 @@ def main() -> int:
                 print("--image requires an argument", file=sys.stderr)
                 return 2
             image, args = args[1], args[2:]
+        elif args[0] == "--no-userns":
+            no_userns, args = True, args[1:]
         elif args[0] in ("-v", "--volume"):
             if len(args) < 2:
                 print(f"{args[0]} requires an argument", file=sys.stderr)
@@ -199,11 +203,12 @@ def main() -> int:
         notify_mounts, notify_env, notify_args = notify_wiring()
 
     tty_flag = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+    userns_flag = [] if no_userns else ["--userns=keep-id"]
 
     cmd = [
         "podman", "run", "--rm", "-i", *tty_flag,
         f"--network={network}",
-        "--userns=keep-id",
+        *userns_flag,
         "--pid=host",
         "-v", f"{HOME}/.claude:{HOME}/.claude",
         *extra_mounts,
