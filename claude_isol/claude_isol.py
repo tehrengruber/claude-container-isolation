@@ -108,6 +108,38 @@ def ensure_image(image: str) -> None:
     subprocess.run(["podman", "build", "-t", image, str(SCRIPT_DIR)], check=True)
 
 
+def image_id(image: str) -> str:
+    """Return the local image's content digest (sha256, no prefix). Pulls
+    the image first if it isn't present locally."""
+    fmt = ["podman", "image", "inspect", "--format", "{{.Id}}", image]
+    r = subprocess.run(fmt, capture_output=True, text=True)
+    if r.returncode != 0:
+        subprocess.run(["podman", "pull", image], check=True)
+        r = subprocess.run(fmt, capture_output=True, text=True, check=True)
+    return r.stdout.strip().removeprefix("sha256:")
+
+
+def install_claude_on_top(base_image: str) -> str:
+    """Build an image that layers the claude-code apt package on top of
+    `base_image` (see Dockerfile.install-claude) and return its tag. The tag is
+    derived from the base image's content digest so a re-pulled base bypasses
+    the stale cache; otherwise podman's layer cache makes the build a no-op."""
+    tag = f"claude-isol-augmented:{image_id(base_image)[:12]}"
+    if subprocess.run(["podman", "image", "exists", tag]).returncode == 0:
+        return tag
+    dockerfile = SCRIPT_DIR / "Dockerfile.install-claude"
+    print(f"building {tag} on top of {base_image}", file=sys.stderr)
+    subprocess.run(
+        ["podman", "build",
+         "-t", tag,
+         "-f", str(dockerfile),
+         "--build-arg", f"BASE_IMAGE={base_image}",
+         str(SCRIPT_DIR)],
+        check=True,
+    )
+    return tag
+
+
 def spawn_proxy(ide_port: str) -> str:
     """Fork the MCP proxy and return the port it bound to.
 
@@ -145,13 +177,15 @@ def main() -> int:
     args = sys.argv[1:]
     drop_shell = False
     image: Optional[str] = None
+    install_claude = False
     no_userns = False
     volume_args: list[str] = []
     # Leading flags are consumed here; the rest is forwarded to claude.
-    #   --shell        drop into bash instead of running claude (e.g. `gh auth login`)
-    #   --image NAME   run the prebuilt image NAME as-is, instead of the bundled default
-    #   --no-userns    omit --userns entirely (use podman's own default)
-    #   -v/--volume V  extra mount, passed straight to `podman run -v` (repeatable)
+    #   --shell           drop into bash instead of running claude (e.g. `gh auth login`)
+    #   --image NAME      run the prebuilt image NAME as-is, instead of the bundled default
+    #   --install-claude  layer the claude-code apt package on top of --image
+    #   --no-userns       omit --userns entirely (use podman's own default)
+    #   -v/--volume V     extra mount, passed straight to `podman run -v` (repeatable)
     while args:
         if args[0] == "--shell":
             drop_shell = True
@@ -161,6 +195,8 @@ def main() -> int:
                 print("--image requires an argument", file=sys.stderr)
                 return 2
             image, args = args[1], args[2:]
+        elif args[0] == "--install-claude":
+            install_claude, args = True, args[1:]
         elif args[0] == "--no-userns":
             no_userns, args = True, args[1:]
         elif args[0] in ("-v", "--volume"):
@@ -172,10 +208,16 @@ def main() -> int:
         else:
             break
 
+    if install_claude and image is None:
+        print("--install-claude requires --image", file=sys.stderr)
+        return 2
+
     if image is None:
         # No image specified: use the bundled default, building it on demand.
         image = DEFAULT_IMAGE
         ensure_image(image)
+    elif install_claude:
+        image = install_claude_on_top(image)
 
     cwd = Path.cwd()
     ide_lock = None if drop_shell else find_ide_lock(cwd)
