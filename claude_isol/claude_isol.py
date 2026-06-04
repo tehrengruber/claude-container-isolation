@@ -222,6 +222,10 @@ def main() -> int:
     cwd = Path.cwd()
     ide_lock = None if drop_shell else find_ide_lock(cwd)
 
+    # Without --userns=keep-id, container uid 0 maps to the host user, so HOME
+    # inside the container is /root rather than the host home path.
+    container_home = Path("/root") if no_userns else HOME
+
     network = "pasta"
     extra_mounts: list[str] = []
 
@@ -230,7 +234,7 @@ def main() -> int:
         tmp_ide = Path(tempfile.mkdtemp(prefix="claude-ide-"))
         shutil.copy(ide_lock, tmp_ide / f"{proxy_port}.lock")
         network = f"pasta:-T,{proxy_port}"
-        extra_mounts = ["-v", f"{tmp_ide}:{HOME}/.claude/ide"]
+        extra_mounts = ["-v", f"{tmp_ide}:{container_home}/.claude/ide"]
 
     gh_config = HOME / ".config" / "gh-claude"
     gh_config.mkdir(parents=True, exist_ok=True)
@@ -252,16 +256,16 @@ def main() -> int:
         f"--network={network}",
         *userns_flag,
         "--pid=host",
-        "-v", f"{HOME}/.claude:{HOME}/.claude",
+        "-v", f"{HOME}/.claude:{container_home}/.claude",
         *extra_mounts,
-        "-v", f"{HOME}/.claude.json:{HOME}/.claude.json",
-        "-v", f"{gh_config}:{HOME}/.config/gh",
-        "-v", f"{gitconfig}:{HOME}/.gitconfig",
+        "-v", f"{HOME}/.claude.json:{container_home}/.claude.json",
+        "-v", f"{gh_config}:{container_home}/.config/gh",
+        "-v", f"{gitconfig}:{container_home}/.gitconfig",
         "-v", f"{cwd}:{cwd}",
         *volume_args,
         *notify_mounts,
         "-w", str(cwd),
-        "-e", f"HOME={HOME}",
+        "-e", f"HOME={container_home}",
         "-e", "TERM",
         *notify_env,
         image,
