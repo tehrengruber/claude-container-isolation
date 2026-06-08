@@ -11,7 +11,7 @@ RUN pacman-key --init \
 RUN printf '\n[arch-pre-built]\nServer = https://github.com/tehrengruber/arch-pre-built-packages/releases/download/latest\n' \
         >> /etc/pacman.conf
 
-RUN pacman -Sy --noconfirm claude-code git github-cli python openmpi base-devel cmake gcc13 gcc14 sudo \
+RUN pacman -Sy --noconfirm claude-code git github-cli python python310 python311 python312 openmpi base-devel cmake gcc13 gcc14 sudo \
  && echo 'ALL ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-claude-isol \
  && chmod 0440 /etc/sudoers.d/00-claude-isol
 
