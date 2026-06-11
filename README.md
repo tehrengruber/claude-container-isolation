@@ -42,7 +42,8 @@ container, with an MCP-filtering proxy in front of the JetBrains IDE link.
 ## Requirements
 
 - `podman` (with `pasta` networking)
-- Python 3.11+ with `websockets`
+- Python 3.11+ with `websockets` and `click`
+- `bubblewrap` (only for `--local` mode)
 
 ## Installing
 
@@ -62,17 +63,61 @@ sudo pacman -U claude-isol-*.pkg.tar.zst
 ## Usage
 
 ```sh
-claude-isol [claude args...]        # run Claude Code
+claude-isol                         # run Claude Code
+claude-isol "fix the bug"           # run with a prompt
 claude-isol --shell                 # drop into bash inside the container
                                     # (handy for `gh auth login` etc.)
-claude-isol --image NAME [args...]  # run a prebuilt image as-is
-claude-isol -v /data:/data [args]   # add extra mounts (repeatable)
+claude-isol --image NAME            # run a prebuilt image as-is
+claude-isol --local                 # run on the host in a bubblewrap sandbox
+claude-isol --tmpfs-home            # mount HOME as a fresh tmpfs (ephemeral home)
+claude-isol -v /data:/data          # add extra mounts (repeatable, both modes)
+claude-isol -- -p "hi" --model opus # forward flags through to claude after `--`
 ```
+
+Unknown options are **rejected** (so a typo'd flag is caught, not silently
+forwarded). To pass options through to `claude`, put them after a `--`
+separator; a bare prompt needs no separator. Run `claude-isol --help` for the
+full flag list.
 
 With no `--image`, `claude-isolation:latest` is used and built from the
 bundled Dockerfile on first run if it isn't present (override the default
 tag with `CLAUDE_ISO_IMAGE`). With `--image NAME`, that image is run as-is
 and never built — bring your own.
+
+`--tmpfs-home` mounts the container's HOME as a fresh tmpfs, so anything the
+image ships under the home dir is wiped and nothing written there persists; the
+`~/.claude`, `~/.claude.json` and scoped `gh`/`git` config are still bind-mounted
+on top, so authentication survives. (Under `--local` the home is always a tmpfs,
+so the flag is a no-op there.)
+
+## Local sandbox mode (`--local`)
+
+`claude-isol --local` skips podman entirely and runs the host's own Claude Code
+under a [bubblewrap](https://github.com/containers/bubblewrap) sandbox — handy when
+you don't want to build or run a container. It requires the `bubblewrap` package
+(`bwrap`).
+
+What it exposes:
+
+- Only the minimal system dirs needed to run, all **read-only**: `/usr`, `/etc`,
+  `/opt`, `/usr/local`, and the usr-merge compat links (`/bin`, `/lib`, …). The
+  layout is probed at runtime, so it works on Arch as well as distros where those
+  are real directories (e.g. some openSUSE setups).
+- The **current working directory** is the single read-write tree.
+- `HOME` is a fresh ephemeral tmpfs; only `~/.claude` and `~/.claude.json` are
+  bound in (writable), plus the scoped `~/.config/gh-claude` / `~/.gitconfig-claude`
+  credentials (same indirection as container mode). Nothing else from your home
+  (ssh keys, other projects) is visible.
+- Networking is shared with the host (Claude needs it to reach the API), and **all
+  host environment variables are forwarded** unchanged.
+- Extra `-v src:dst[:ro]` mounts are honored (translated to bwrap binds).
+
+`--local --shell` drops into your shell (`$SHELL`, falling back to bash) inside the
+same sandbox (handy for inspecting what's exposed, or `gh auth login` against the
+scoped credentials).
+
+The JetBrains MCP proxy and host notifications are container-only and not wired up
+in `--local` mode.
 
 ## Host notifications
 

@@ -22,6 +22,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+import click
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGE = os.environ.get("CLAUDE_ISO_IMAGE", "claude-isolation:latest")
 HOME = Path(os.environ["HOME"])
@@ -101,6 +103,78 @@ def notify_wiring() -> tuple[list[str], list[str], list[str]]:
     return mounts, env, claude_args
 
 
+def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str]) -> list[str]:
+    """Build the `bwrap` argv for --local mode: a host sandbox that exposes only the
+    minimal system dirs read-only, a fresh ephemeral HOME with just the Claude config
+    bound in, and the cwd as the single read-write tree. `inner` is the command run
+    inside the sandbox (e.g. `["claude", ...]` or `["bash"]`).
+
+    The system-dir layout is probed at runtime rather than hardcoded so the same logic
+    works on Arch (where /bin /lib /sbin are symlinks into /usr) and on distros where
+    they are real directories (some openSUSE layouts).
+    """
+    cmd = ["bwrap"]
+
+    # Read-only system dirs that always live at a fixed path when present.
+    for d in ("/usr", "/etc", "/opt", "/usr/local"):
+        if Path(d).is_dir():
+            cmd += ["--ro-bind", d, d]
+
+    # The usr-merge compatibility entries: recreate symlinks as-is, bind real dirs.
+    for d in ("/bin", "/sbin", "/lib", "/lib64"):
+        p = Path(d)
+        if p.is_symlink():
+            cmd += ["--symlink", os.readlink(d), d]
+        elif p.is_dir():
+            cmd += ["--ro-bind", d, d]
+
+    # Make sure the claude binary itself is reachable if it lives outside the
+    # dirs bound above (e.g. an npm-global install under /usr/local or elsewhere).
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        real = os.path.realpath(claude_bin)
+        if not any(real.startswith(p + "/") for p in ("/usr", "/opt", "/bin", "/sbin")):
+            d = os.path.dirname(real)
+            cmd += ["--ro-bind", d, d]
+
+    cmd += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+
+    # Fresh ephemeral HOME (writable tmpfs so ~/.cache etc. work), with only the
+    # Claude config and the scoped gh/git credentials bound in.
+    home = str(HOME)
+    cmd += [
+        "--tmpfs", home,
+        "--bind", f"{HOME}/.claude", f"{home}/.claude",
+        "--bind", f"{HOME}/.claude.json", f"{home}/.claude.json",
+        "--bind", f"{HOME}/.config/gh-claude", f"{home}/.config/gh",
+        "--bind", f"{HOME}/.gitconfig-claude", f"{home}/.gitconfig",
+    ]
+
+    # The one read-write tree. Placed after the tmpfs home so a cwd under HOME
+    # still wins by bwrap's last-wins ordering.
+    cmd += ["--bind", str(cwd), str(cwd)]
+
+    # User -v specs, translated from podman's src:dst[:opts] to bwrap binds.
+    # Placed last so the user can override anything bound above.
+    for spec in volumes:
+        parts = spec.split(":")
+        if len(parts) == 1:
+            src = dst = parts[0]
+            opts = ""
+        else:
+            src, dst = parts[0], parts[1]
+            opts = parts[2] if len(parts) > 2 else ""
+        flag = "--ro-bind" if "ro" in opts.split(",") else "--bind"
+        cmd += [flag, src, dst]
+
+    cmd += [
+        "--chdir", str(cwd),
+        "--unshare-all", "--share-net", "--die-with-parent",
+        *inner,
+    ]
+    return cmd
+
+
 def ensure_image(image: str) -> None:
     if subprocess.run(["podman", "image", "exists", image]).returncode == 0:
         return
@@ -173,44 +247,70 @@ def spawn_proxy(ide_port: str) -> str:
     return port
 
 
-def main() -> int:
-    args = sys.argv[1:]
-    drop_shell = False
-    image: Optional[str] = None
-    install_claude = False
-    no_userns = False
-    volume_args: list[str] = []
-    # Leading flags are consumed here; the rest is forwarded to claude.
-    #   --shell           drop into bash instead of running claude (e.g. `gh auth login`)
-    #   --image NAME      run the prebuilt image NAME as-is, instead of the bundled default
-    #   --install-claude  layer the claude-code apt package on top of --image
-    #   --no-userns       omit --userns entirely (use podman's own default)
-    #   -v/--volume V     extra mount, passed straight to `podman run -v` (repeatable)
-    while args:
-        if args[0] == "--shell":
-            drop_shell = True
-            args = args[1:]
-        elif args[0] == "--image":
-            if len(args) < 2:
-                print("--image requires an argument", file=sys.stderr)
-                return 2
-            image, args = args[1], args[2:]
-        elif args[0] == "--install-claude":
-            install_claude, args = True, args[1:]
-        elif args[0] == "--no-userns":
-            no_userns, args = True, args[1:]
-        elif args[0] in ("-v", "--volume"):
-            if len(args) < 2:
-                print(f"{args[0]} requires an argument", file=sys.stderr)
-                return 2
-            volume_args += ["-v", args[1]]
-            args = args[2:]
-        else:
-            break
+def _validate_volume(ctx, param, value):
+    """Reject malformed -v specs up front: SRC:DST[:OPTS] (or a single PATH), with
+    non-empty SRC/DST and at most one options field."""
+    for spec in value:
+        parts = spec.split(":")
+        if len(parts) > 3 or any(p == "" for p in parts[: min(len(parts), 2)]):
+            raise click.BadParameter(
+                f"{spec!r}: expected SRC:DST[:OPTS] (or a single PATH)", param=param)
+    return value
 
-    if install_claude and image is None:
-        print("--install-claude requires --image", file=sys.stderr)
-        return 2
+
+# Strict parsing: an unrecognized option (e.g. a typo'd --shel) is rejected rather
+# than silently forwarded. To pass options through to claude, separate them with
+# `--`, e.g. `claude-isol --local -- -p "hi" --model opus`. A bare prompt needs no
+# separator (`claude-isol "fix the bug"`).
+@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.option("--shell", "drop_shell", is_flag=True,
+              help="Drop into a shell instead of running claude (e.g. `gh auth login`).")
+@click.option("--image", metavar="NAME",
+              help="Run the prebuilt image NAME as-is, instead of the bundled default.")
+@click.option("--install-claude", is_flag=True,
+              help="Layer the claude-code package on top of --image.")
+@click.option("--no-userns", is_flag=True,
+              help="Omit --userns entirely (use podman's default; HOME becomes /root).")
+@click.option("--local", is_flag=True,
+              help="Run on the host under a bubblewrap sandbox (no container).")
+@click.option("--tmpfs-home", is_flag=True,
+              help="Mount HOME as a fresh tmpfs (already the default under --local).")
+@click.option("-v", "--volume", "volumes", multiple=True, metavar="SRC:DST[:OPTS]",
+              callback=_validate_volume,
+              help="Extra mount, repeatable; works in both modes.")
+@click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
+def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
+         volumes, claude_args):
+    """Run Claude Code in isolation.
+
+    Unknown options are rejected; pass options through to claude after a `--`
+    separator, e.g. `claude-isol --local -- -p "hi"`.
+    """
+    args = list(claude_args)
+    volumes = list(volumes)
+
+    if install_claude and not image:
+        raise click.UsageError("--install-claude requires --image")
+
+    if local and (image or install_claude or no_userns):
+        raise click.UsageError(
+            "--local cannot be combined with --image/--install-claude/--no-userns")
+    if local and tmpfs_home:
+        click.echo("note: --tmpfs-home is redundant under --local "
+                   "(HOME is always a tmpfs there)", err=True)
+
+    if local:
+        if shutil.which("bwrap") is None:
+            click.echo("--local requires bubblewrap (bwrap); install the "
+                       "'bubblewrap' package", err=True)
+            raise SystemExit(2)
+        cwd = Path.cwd()
+        # Scoped gh/git credentials, created on first run (shared with container mode).
+        (HOME / ".config" / "gh-claude").mkdir(parents=True, exist_ok=True)
+        (HOME / ".gitconfig-claude").touch(exist_ok=True)
+        inner = [os.environ.get("SHELL", "bash")] if drop_shell else ["claude", *args]
+        os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner))
+        return  # unreachable
 
     if image is None:
         # No image specified: use the bundled default, building it on demand.
@@ -250,11 +350,15 @@ def main() -> int:
 
     tty_flag = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
     userns_flag = [] if no_userns else ["--userns=keep-id"]
+    # A tmpfs HOME wipes whatever the image ships under the home dir; the config
+    # bind mounts below are layered on top (podman orders mounts parent-first).
+    tmpfs_flag = ["--tmpfs", str(container_home)] if tmpfs_home else []
 
     cmd = [
         "podman", "run", "--rm", "-i", *tty_flag,
         f"--network={network}",
         *userns_flag,
+        *tmpfs_flag,
         "--pid=host",
         "-v", f"{HOME}/.claude:{container_home}/.claude",
         *extra_mounts,
@@ -262,7 +366,7 @@ def main() -> int:
         "-v", f"{gh_config}:{container_home}/.config/gh",
         "-v", f"{gitconfig}:{container_home}/.gitconfig",
         "-v", f"{cwd}:{cwd}",
-        *volume_args,
+        *[arg for spec in volumes for arg in ("-v", spec)],
         *notify_mounts,
         "-w", str(cwd),
         "-e", f"HOME={container_home}",
@@ -273,8 +377,8 @@ def main() -> int:
     ]
 
     os.execvp("podman", cmd)
-    return 1  # unreachable
+    return  # unreachable
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()

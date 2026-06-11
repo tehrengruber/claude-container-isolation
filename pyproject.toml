@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Run Claude Code in an isolated podman container with an MCP-filtering proxy"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["websockets"]
+dependencies = ["websockets", "click"]
 
 [project.scripts]
 claude-isol = "claude_isol.claude_isol:main"
