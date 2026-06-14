@@ -1,0 +1,15 @@
+# Grant the --no-lan loader exactly the privileges it needs to load and attach
+# the cgroup egress filter -- nothing more. This is why claude-isol --no-lan
+# needs no sudo. (File capabilities can't be carried in the package payload
+# under fakeroot, so they're applied here.)
+_setcaps() {
+    setcap cap_bpf,cap_net_admin+ep /usr/lib/claude-isol/lan_block_load
+}
+
+post_install() {
+    _setcaps
+}
+
+post_upgrade() {
+    _setcaps
+}

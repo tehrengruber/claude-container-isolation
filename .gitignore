@@ -10,5 +10,9 @@ pkg/
 src/
 *.pkg.tar.zst
 
+# BPF artifacts from a stray in-tree `make` (the package builds these into build/)
+claude_isol/bpf/lan_block.bpf.o
+claude_isol/bpf/lan_block_load
+
 # Editor
 .idea/

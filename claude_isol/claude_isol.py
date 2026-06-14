@@ -28,6 +28,15 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGE = os.environ.get("CLAUDE_ISO_IMAGE", "claude-isolation:latest")
 HOME = Path(os.environ["HOME"])
 
+# --no-lan: the BPF egress filter (drops traffic to private ranges) is attached to
+# a per-run cgroup by a small root-owned helper; DNS is pinned to a public resolver
+# so it survives the LAN block. See bpf/lan_block.bpf.c and bpf/lan_block_load.c.
+PUBLIC_DNS = ("1.1.1.1", "1.0.0.1")  # Cloudflare
+NOLAN_LOADER_PATHS = (
+    Path("/usr/lib/claude-isol/lan_block_load"),
+    SCRIPT_DIR / "bpf" / "lan_block_load",
+)
+
 # Host-notification wiring (see notifyd.py / notify_client.py). The forwarder and
 # socket are mounted at fixed container paths; the daemon's socket lives under
 # the host's XDG runtime dir.
@@ -103,7 +112,53 @@ def notify_wiring() -> tuple[list[str], list[str], list[str]]:
     return mounts, env, claude_args
 
 
-def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str]) -> list[str]:
+def _current_cgroup_path() -> Path:
+    """The launcher's own cgroup v2 directory under /sys/fs/cgroup."""
+    for line in Path("/proc/self/cgroup").read_text().splitlines():
+        if line.startswith("0::"):
+            return Path("/sys/fs/cgroup") / line[3:].lstrip("/")
+    raise SystemExit("--no-lan needs cgroup v2 (unified hierarchy)")
+
+
+def _nolan_loader() -> Path:
+    for p in NOLAN_LOADER_PATHS:
+        if p.exists():
+            return p
+    raise SystemExit(
+        "--no-lan: lan_block_load not found; build it with "
+        "`make -C claude_isol/bpf` or install it under /usr/lib/claude-isol")
+
+
+def setup_nolan_cgroup() -> Path:
+    """Create a per-run cgroup and attach the LAN-block BPF filter to it via the
+    capability-bearing loader. Processes placed in this cgroup -- or any
+    descendant -- can reach the internet but not the local networks."""
+    base = _current_cgroup_path()
+    # We exec away after this, so we can't clean up our own cgroup on exit; sweep
+    # empty leftovers from prior runs instead (rmdir only succeeds when unused).
+    for stale in base.glob("claude-isol-nolan-*"):
+        try:
+            stale.rmdir()
+        except OSError:
+            pass
+    run_cg = base / f"claude-isol-nolan-{os.getpid()}"
+    run_cg.mkdir(exist_ok=True)
+    # The loader carries file caps (cap_bpf,cap_net_admin) so no sudo is needed.
+    subprocess.run([str(_nolan_loader()), str(run_cg)], check=True)
+    return run_cg
+
+
+def public_resolv() -> Path:
+    """A resolv.conf pointing at the public resolver, bound into the sandbox/container
+    so DNS still resolves once the LAN (and any LAN resolver) is blocked."""
+    fd, path = tempfile.mkstemp(prefix="claude-isol-resolv-")
+    with os.fdopen(fd, "w") as fh:
+        fh.write("".join(f"nameserver {ns}\n" for ns in PUBLIC_DNS))
+    return Path(path)
+
+
+def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
+                    resolv: Optional[Path] = None) -> list[str]:
     """Build the `bwrap` argv for --local mode: a host sandbox that exposes only the
     minimal system dirs read-only, a fresh ephemeral HOME with just the Claude config
     bound in, and the cwd as the single read-write tree. `inner` is the command run
@@ -166,6 +221,20 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str]) -> list[str
             opts = parts[2] if len(parts) > 2 else ""
         flag = "--ro-bind" if "ro" in opts.split(",") else "--bind"
         cmd += [flag, src, dst]
+
+    # --no-lan: override the resolver (the host's may point at the now-blocked LAN).
+    # Placed after the /etc ro-bind so it wins by bwrap's last-wins ordering.
+    #
+    # /etc/resolv.conf is usually a symlink (systemd-resolved, NetworkManager, ...).
+    # Mounting straight onto it makes the kernel follow the symlink to a target that
+    # doesn't exist in the sandbox -> ENOENT. So when it's a symlink we bind our file
+    # at the symlink's resolved target instead; the symlink itself (carried in by the
+    # /etc ro-bind) then resolves to our file. For a plain file we bind it directly.
+    if resolv is not None:
+        target = "/etc/resolv.conf"
+        if os.path.islink(target):
+            target = os.path.realpath(target)
+        cmd += ["--ro-bind", str(resolv), target]
 
     cmd += [
         "--chdir", str(cwd),
@@ -275,12 +344,15 @@ def _validate_volume(ctx, param, value):
               help="Run on the host under a bubblewrap sandbox (no container).")
 @click.option("--tmpfs-home", is_flag=True,
               help="Mount HOME as a fresh tmpfs (already the default under --local).")
+@click.option("--no-lan", is_flag=True,
+              help="Block all traffic to local networks (the internet stays "
+                   "reachable); DNS is pinned to a public resolver. Works in both modes.")
 @click.option("-v", "--volume", "volumes", multiple=True, metavar="SRC:DST[:OPTS]",
               callback=_validate_volume,
               help="Extra mount, repeatable; works in both modes.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
-         volumes, claude_args):
+         no_lan, volumes, claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -309,7 +381,14 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         (HOME / ".config" / "gh-claude").mkdir(parents=True, exist_ok=True)
         (HOME / ".gitconfig-claude").touch(exist_ok=True)
         inner = [os.environ.get("SHELL", "bash")] if drop_shell else ["claude", *args]
-        os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner))
+        resolv = None
+        if no_lan:
+            run_cg = setup_nolan_cgroup()
+            resolv = public_resolv()
+            # Move ourselves into the filtered cgroup; the exec'd bwrap (and its
+            # whole tree) inherit the membership and thus the egress filter.
+            (run_cg / "cgroup.procs").write_text(str(os.getpid()))
+        os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner, resolv))
         return  # unreachable
 
     if image is None:
@@ -354,9 +433,34 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     # bind mounts below are layered on top (podman orders mounts parent-first).
     tmpfs_flag = ["--tmpfs", str(container_home)] if tmpfs_home else []
 
+    # --no-lan: run the whole podman process tree under a cgroup that carries the
+    # egress filter, and pin DNS to the public resolver.
+    #
+    # Two things matter here. (1) We must use the cgroupfs manager: with the
+    # default systemd manager, rootless podman asks the user systemd manager for a
+    # fresh podman-<pid>.scope and moves itself there, escaping our cgroup. (2) We
+    # do NOT pass our cgroup's full root-relative path as --cgroup-parent -- rootless
+    # podman+cgroupfs interprets --cgroup-parent relative to its *current* cgroup, so
+    # the full path gets appended to wherever podman already is, creating a doubled,
+    # unfiltered cgroup elsewhere. Instead we move ourselves into the filtered cgroup
+    # just before exec (see below); podman then stays put (cgroupfs manager) and
+    # creates conmon, pasta and the container as descendants -- all inheriting the
+    # filter. pasta is the process that re-originates the container's packets, so it
+    # too must live under the filtered cgroup, which this guarantees.
+    nolan_flags: list[str] = []
+    nolan_cg: Optional[Path] = None
+    if no_lan:
+        nolan_cg = setup_nolan_cgroup()
+        nolan_flags = [
+            "--cgroup-manager=cgroupfs",
+            "--cgroup-parent=ctr",
+            *[a for ns in PUBLIC_DNS for a in ("--dns", ns)],
+        ]
+
     cmd = [
         "podman", "run", "--rm", "-i", *tty_flag,
         f"--network={network}",
+        *nolan_flags,
         *userns_flag,
         *tmpfs_flag,
         "--pid=host",
@@ -375,6 +479,12 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         image,
         *(["bash"] if drop_shell else ["claude", *notify_args, *args]),
     ]
+
+    # Move ourselves into the filtered cgroup last, just before exec: with the
+    # cgroupfs manager podman stays in this cgroup and spawns conmon/pasta/the
+    # container beneath it, so the egress filter is inherited by the lot.
+    if nolan_cg is not None:
+        (nolan_cg / "cgroup.procs").write_text(str(os.getpid()))
 
     os.execvp("podman", cmd)
     return  # unreachable
