@@ -6,8 +6,10 @@ pkgrel=1
 pkgdesc="Run Claude Code inside an isolated podman container with an MCP-filtering proxy"
 arch=('any')
 license=('custom')
-depends=('podman' 'python' 'python-websockets' 'python-click' 'glib2' 'libbpf')
-optdepends=('bubblewrap: for --local host-sandbox mode (no container)')
+depends=('podman' 'python' 'python-websockets' 'python-click' 'glib2')
+optdepends=('bubblewrap: for --local host-sandbox mode (no container)'
+            'libbpf: for --no-lan (block LAN, keep internet)'
+            'systemd: for --no-lan in non-delegated sessions (SSH/TTY/IDE terminals)')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel'
              'clang' 'libbpf')
 install="$pkgname.install"

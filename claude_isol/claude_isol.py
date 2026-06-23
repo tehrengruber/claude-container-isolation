@@ -36,6 +36,8 @@ NOLAN_LOADER_PATHS = (
     Path("/usr/lib/claude-isol/lan_block_load"),
     SCRIPT_DIR / "bpf" / "lan_block_load",
 )
+# Set once we have re-exec'd into a delegated scope, to break the re-exec loop.
+NOLAN_SCOPE_ENV = "CLAUDE_ISOL_NOLAN_SCOPE"
 
 # Host-notification wiring (see notifyd.py / notify_client.py). The forwarder and
 # socket are mounted at fixed container paths; the daemon's socket lives under
@@ -120,6 +122,41 @@ def _current_cgroup_path() -> Path:
     raise SystemExit("--no-lan needs cgroup v2 (unified hierarchy)")
 
 
+def _cgroup_is_delegated() -> bool:
+    """True if we may create child cgroups in our current cgroup, i.e. the cgroup
+    directory is delegated to us (writable). Terminals launched via the user systemd
+    manager (e.g. GNOME Terminal's vte-spawn scope) are delegated; bare login session
+    scopes (PyCharm's terminal, SSH, plain TTY) are root-owned and are not."""
+    try:
+        return os.access(_current_cgroup_path(), os.W_OK | os.X_OK)
+    except OSError:
+        return False
+
+
+def reexec_in_delegated_scope() -> None:
+    """--no-lan needs to create a per-run cgroup, which requires a delegated cgroup.
+    When we were started in a non-delegated one (session-N.scope), re-exec the whole
+    invocation under a transient, delegated user scope so our own systemd --user
+    manager places us somewhere we can manage. No-op when already delegated, and
+    guarded by an env var so the re-exec'd copy never loops."""
+    if os.environ.get(NOLAN_SCOPE_ENV) or _cgroup_is_delegated():
+        return
+    systemd_run = shutil.which("systemd-run")
+    if systemd_run is None:
+        raise SystemExit(
+            "--no-lan: this terminal's cgroup is not delegated and systemd-run is "
+            "missing, so the egress filter's cgroup can't be created. Launch from a "
+            "terminal started by your desktop's systemd user manager, or install "
+            "systemd-run.")
+    env = {**os.environ, NOLAN_SCOPE_ENV: "1"}
+    # --scope keeps the command in the foreground on this TTY; Delegate=yes hands us
+    # ownership of the scope's cgroup subtree so setup_nolan_cgroup() can mkdir in it.
+    os.execvpe(systemd_run, [
+        systemd_run, "--user", "--scope", "--quiet", "--property=Delegate=yes",
+        "--", sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:],
+    ], env)
+
+
 def _nolan_loader() -> Path:
     for p in NOLAN_LOADER_PATHS:
         if p.exists():
@@ -144,7 +181,18 @@ def setup_nolan_cgroup() -> Path:
     run_cg = base / f"claude-isol-nolan-{os.getpid()}"
     run_cg.mkdir(exist_ok=True)
     # The loader carries file caps (cap_bpf,cap_net_admin) so no sudo is needed.
-    subprocess.run([str(_nolan_loader()), str(run_cg)], check=True)
+    # Its own stderr (success line, or a precise attach error) passes through.
+    proc = subprocess.run([str(_nolan_loader()), str(run_cg)])
+    if proc.returncode == 127:
+        # Dynamic linker aborted before main(): the loader is built against
+        # libbpf.so but the runtime library isn't installed.
+        raise SystemExit(
+            "--no-lan: the egress-filter loader could not start -- libbpf is not "
+            "installed. Install it (Arch: pacman -S libbpf), or drop --no-lan.")
+    if proc.returncode != 0:
+        raise SystemExit(
+            f"--no-lan: the egress-filter loader failed (exit {proc.returncode}); "
+            "see its error above.")
     return run_cg
 
 
@@ -370,6 +418,11 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     if local and tmpfs_home:
         click.echo("note: --tmpfs-home is redundant under --local "
                    "(HOME is always a tmpfs there)", err=True)
+
+    # --no-lan creates a per-run cgroup; if our terminal's cgroup isn't delegated
+    # (PyCharm/SSH/TTY), re-exec into a delegated scope first. No-op otherwise.
+    if no_lan:
+        reexec_in_delegated_scope()
 
     if local:
         if shutil.which("bwrap") is None:
