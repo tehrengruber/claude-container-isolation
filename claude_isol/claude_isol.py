@@ -241,6 +241,51 @@ def public_resolv() -> Path:
     return Path(path)
 
 
+def _ca_trust_binds() -> list[str]:
+    """Read-only binds so the CA trust store resolves inside the --local sandbox.
+
+    /etc and /usr are already ro-bound, which covers the usual layouts (Debian and
+    Arch keep certs under /etc + /usr; Fedora under /etc/pki). But some distros store
+    the real certs elsewhere and only symlink into /etc -- notably openSUSE, whose
+    /etc/ssl/certs/*.pem and /etc/ssl/ca-bundle.pem point into /var/lib/ca-certificates.
+    A recursive /etc bind then carries those symlinks in but not their targets, so they
+    dangle and TLS fails with "unable to get local issuer certificate". Resolve the
+    well-known trust anchors -- and the symlinks inside the cert dir -- and bind any
+    real location that lives outside the trees already bound above."""
+    bound = ("/usr", "/etc", "/opt")
+    targets: set[str] = set()
+
+    def consider(path: str) -> None:
+        if not os.path.lexists(path):
+            return
+        real = os.path.realpath(path)
+        if not os.path.exists(real):  # broken symlink on the host: nothing to bind
+            return
+        d = real if os.path.isdir(real) else os.path.dirname(real)
+        if not any(d == b or d.startswith(b + "/") for b in bound):
+            targets.add(d)
+
+    # Bundle files and the cert dir itself (any of these may be a symlink outward).
+    for p in ("/etc/ssl/certs", "/etc/ssl/cert.pem", "/etc/ssl/ca-bundle.pem",
+              "/etc/pki/tls/certs/ca-bundle.crt"):
+        consider(p)
+    # Entries inside the cert dir are commonly per-cert symlinks into an external
+    # tree (openSUSE's /var/lib/ca-certificates/pem); follow each and collect it.
+    certs_dir = Path("/etc/ssl/certs")
+    if certs_dir.is_dir():
+        for entry in certs_dir.iterdir():
+            if entry.is_symlink():
+                consider(str(entry))
+
+    # Drop any target nested under another; binding the ancestor already covers it.
+    minimal = [d for d in targets
+               if not any(d != o and d.startswith(o + "/") for o in targets)]
+    binds: list[str] = []
+    for d in sorted(minimal):
+        binds += ["--ro-bind", d, d]
+    return binds
+
+
 def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
                     resolv: Optional[Path] = None) -> list[str]:
     """Build the `bwrap` argv for --local mode: a host sandbox that exposes only the
@@ -275,6 +320,10 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
         if not any(real.startswith(p + "/") for p in ("/usr", "/opt", "/bin", "/sbin")):
             d = os.path.dirname(real)
             cmd += ["--ro-bind", d, d]
+
+    # CA trust store: bind any trust anchors that live outside the system trees
+    # already bound above (see _ca_trust_binds).
+    cmd += _ca_trust_binds()
 
     cmd += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
 
