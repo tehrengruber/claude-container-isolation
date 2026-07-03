@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import grp
 import json
 import os
+import pwd
 import shutil
 import signal
 import subprocess
@@ -286,6 +288,59 @@ def _ca_trust_binds() -> list[str]:
     return binds
 
 
+def _nss_file_with_row(src: str, key: int, row: str) -> Optional[Path]:
+    """A temp copy of the colon-separated file `src` with `row` appended -- unless a
+    line already carries numeric id `key` in its third field, in which case the id is
+    already resolvable from the file the /etc bind carries in and we return None."""
+    try:
+        existing = Path(src).read_text()
+    except OSError:
+        existing = ""
+    for line in existing.splitlines():
+        fields = line.split(":")
+        if len(fields) > 2 and fields[2] == str(key):
+            return None
+    fd, path = tempfile.mkstemp(prefix="claude-isol-nss-")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(existing)
+        if existing and not existing.endswith("\n"):
+            fh.write("\n")
+        fh.write(row)
+    return Path(path)
+
+
+def _passwd_group_binds() -> list[str]:
+    """Make the launching user resolvable inside the --local sandbox.
+
+    Directory accounts (LDAP/AD via SSSD/nss) have no row in /etc/passwd or /etc/group
+    -- they're served over an nss socket the sandbox doesn't expose -- so getpwuid()
+    inside fails ("cannot find name for user ID ...") and breaks whoami, git, shell
+    prompt expansion, etc. Copy the host's files and append the current user's/group's
+    row when it's missing, then bind the copies over /etc/{passwd,group}. Placed after
+    the /etc ro-bind so they win by bwrap's last-wins ordering."""
+    binds: list[str] = []
+    try:
+        pw = pwd.getpwuid(os.getuid())
+    except KeyError:
+        pw = None
+    if pw is not None:
+        row = ":".join((pw.pw_name, "x", str(pw.pw_uid), str(pw.pw_gid),
+                        pw.pw_gecos, pw.pw_dir, pw.pw_shell)) + "\n"
+        f = _nss_file_with_row("/etc/passwd", pw.pw_uid, row)
+        if f is not None:
+            binds += ["--ro-bind", str(f), "/etc/passwd"]
+    try:
+        gr = grp.getgrgid(os.getgid())
+    except KeyError:
+        gr = None
+    if gr is not None:
+        row = ":".join((gr.gr_name, "x", str(gr.gr_gid), ",".join(gr.gr_mem))) + "\n"
+        f = _nss_file_with_row("/etc/group", gr.gr_gid, row)
+        if f is not None:
+            binds += ["--ro-bind", str(f), "/etc/group"]
+    return binds
+
+
 def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
                     resolv: Optional[Path] = None) -> list[str]:
     """Build the `bwrap` argv for --local mode: a host sandbox that exposes only the
@@ -324,6 +379,10 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
     # CA trust store: bind any trust anchors that live outside the system trees
     # already bound above (see _ca_trust_binds).
     cmd += _ca_trust_binds()
+
+    # Make the launching user (a directory account may be absent from /etc/passwd)
+    # resolvable inside the sandbox (see _passwd_group_binds).
+    cmd += _passwd_group_binds()
 
     cmd += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
 
