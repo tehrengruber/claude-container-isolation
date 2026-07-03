@@ -306,19 +306,26 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
         flag = "--ro-bind" if "ro" in opts.split(",") else "--bind"
         cmd += [flag, src, dst]
 
-    # --no-lan: override the resolver (the host's may point at the now-blocked LAN).
-    # Placed after the /etc ro-bind so it wins by bwrap's last-wins ordering.
+    # Make DNS resolution work inside the sandbox.
     #
-    # /etc/resolv.conf is usually a symlink (systemd-resolved, NetworkManager, ...).
-    # Mounting straight onto it makes the kernel follow the symlink to a target that
-    # doesn't exist in the sandbox -> ENOENT. So when it's a symlink we bind our file
-    # at the symlink's resolved target instead; the symlink itself (carried in by the
-    # /etc ro-bind) then resolves to our file. For a plain file we bind it directly.
-    if resolv is not None:
-        target = "/etc/resolv.conf"
-        if os.path.islink(target):
-            target = os.path.realpath(target)
-        cmd += ["--ro-bind", str(resolv), target]
+    # /etc/resolv.conf is usually a symlink (systemd-resolved, NetworkManager, ...)
+    # into /run. The /etc ro-bind above carries the symlink in, but its target lives
+    # under /run, which the sandbox never mounts -- so the symlink dangles and every
+    # lookup fails. We therefore bind a real file at the symlink's *resolved* target;
+    # the symlink (carried in by the /etc ro-bind) then resolves to it. For a plain
+    # /etc/resolv.conf the ro-bind already exposes the real contents, so we only bind
+    # when we have an override to apply.
+    #
+    # The bound file is our public-resolver override under --no-lan (whose resolver
+    # must survive the LAN block), otherwise the host's own resolved resolv.conf.
+    # Placed after the /etc ro-bind so it wins by bwrap's last-wins ordering.
+    etc_resolv = "/etc/resolv.conf"
+    if os.path.islink(etc_resolv):
+        target = os.path.realpath(etc_resolv)
+        src = resolv if resolv is not None else Path(target)
+        cmd += ["--ro-bind", str(src), target]
+    elif resolv is not None:
+        cmd += ["--ro-bind", str(resolv), etc_resolv]
 
     cmd += [
         "--chdir", str(cwd),
