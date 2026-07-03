@@ -196,6 +196,42 @@ def setup_nolan_cgroup() -> Path:
     return run_cg
 
 
+def _submounts_under(path: Path) -> list[str]:
+    """Mountpoints nested strictly under `path` in the caller's mount table -- the
+    foreign filesystems (LUKS volumes, nested binds) a recursive bind of `path` would
+    drag into the sandbox."""
+    root = str(path)
+    out = []
+    for line in Path("/proc/self/mountinfo").read_text().splitlines():
+        fields = line.split(" ")
+        if len(fields) > 4:
+            mp = fields[4]  # mount point, may carry octal-escaped chars
+            if mp != root and mp.startswith(root + "/"):
+                out.append(mp)
+    return out
+
+
+def confirm_cwd_submounts(cwd: Path, skip: bool) -> None:
+    """The working directory is always bind-mounted recursively: rootless runtimes
+    can't create a non-recursive bind of a subtree that contains mounts (the kernel
+    locks inherited mounts in a user namespace and rejects detaching from them with
+    EINVAL), and overmounting a submount to hide it is bypassable by container-root.
+    So any filesystem mounted under cwd is genuinely exposed to the sandbox. List
+    those and confirm before exec'ing -- a stderr note would vanish the moment
+    claude's full-screen UI repaints. --mount-cwd-recursively skips the prompt."""
+    if skip:
+        return
+    nested = _submounts_under(cwd)
+    if not nested:
+        return
+    click.echo(
+        "The working directory is bind-mounted recursively, so these filesystems "
+        "mounted under it will be exposed (read-write) to the sandbox:", err=True)
+    for mp in nested:
+        click.echo(f"  - {mp}", err=True)
+    click.confirm("Proceed and expose them?", default=False, abort=True, err=True)
+
+
 def public_resolv() -> Path:
     """A resolv.conf pointing at the public resolver, bound into the sandbox/container
     so DNS still resolves once the LAN (and any LAN resolver) is blocked."""
@@ -392,6 +428,11 @@ def _validate_volume(ctx, param, value):
               help="Run on the host under a bubblewrap sandbox (no container).")
 @click.option("--tmpfs-home", is_flag=True,
               help="Mount HOME as a fresh tmpfs (already the default under --local).")
+@click.option("--mount-cwd-recursively", is_flag=True,
+              help="Skip the confirmation prompted when filesystems are mounted under "
+                   "the working directory. The cwd is always bound recursively (rootless "
+                   "runtimes can't bind a subtree non-recursively), so such submounts "
+                   "are exposed to the sandbox; this acknowledges that up front.")
 @click.option("--no-lan", is_flag=True,
               help="Block all traffic to local networks (the internet stays "
                    "reachable); DNS is pinned to a public resolver. Works in both modes.")
@@ -400,7 +441,7 @@ def _validate_volume(ctx, param, value):
               help="Extra mount, repeatable; works in both modes.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
-         no_lan, volumes, claude_args):
+         mount_cwd_recursively, no_lan, volumes, claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -430,6 +471,7 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
                        "'bubblewrap' package", err=True)
             raise SystemExit(2)
         cwd = Path.cwd()
+        confirm_cwd_submounts(cwd, mount_cwd_recursively)
         # Scoped gh/git credentials, created on first run (shared with container mode).
         (HOME / ".config" / "gh-claude").mkdir(parents=True, exist_ok=True)
         (HOME / ".gitconfig-claude").touch(exist_ok=True)
@@ -452,6 +494,7 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         image = install_claude_on_top(image)
 
     cwd = Path.cwd()
+    confirm_cwd_submounts(cwd, mount_cwd_recursively)
     ide_lock = None if drop_shell else find_ide_lock(cwd)
 
     # Without --userns=keep-id, container uid 0 maps to the host user, so HOME
