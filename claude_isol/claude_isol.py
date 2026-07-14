@@ -342,7 +342,8 @@ def _passwd_group_binds() -> list[str]:
 
 
 def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
-                    resolv: Optional[Path] = None) -> list[str]:
+                    resolv: Optional[Path] = None,
+                    dev_binds: Optional[list[str]] = None) -> list[str]:
     """Build the `bwrap` argv for --local mode: a host sandbox that exposes only the
     minimal system dirs read-only, a fresh ephemeral HOME with just the Claude config
     bound in, and the cwd as the single read-write tree. `inner` is the command run
@@ -413,6 +414,14 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
             opts = parts[2] if len(parts) > 2 else ""
         flag = "--ro-bind" if "ro" in opts.split(",") else "--bind"
         cmd += [flag, src, dst]
+
+    # User --dev-bind specs: like -v but mounted with device access, so device nodes
+    # (GPUs at /dev/dri, /dev/bus/usb, ...) actually work -- a plain bind blocks that.
+    # bwrap-only. Placed after -v so a later --dev-bind can override an earlier -v.
+    for spec in dev_binds or []:
+        parts = spec.split(":")
+        src, dst = (parts[0], parts[0]) if len(parts) == 1 else (parts[0], parts[1])
+        cmd += ["--dev-bind", src, dst]
 
     # Make DNS resolution work inside the sandbox.
     #
@@ -526,6 +535,17 @@ def _validate_volume(ctx, param, value):
     return value
 
 
+def _validate_dev_bind(ctx, param, value):
+    """Reject malformed --dev-bind specs: SRC:DST (or a single PATH), both non-empty.
+    Unlike -v there is no options field (a device bind is always read-write)."""
+    for spec in value:
+        parts = spec.split(":")
+        if len(parts) > 2 or any(p == "" for p in parts):
+            raise click.BadParameter(
+                f"{spec!r}: expected SRC:DST (or a single PATH)", param=param)
+    return value
+
+
 # Strict parsing: an unrecognized option (e.g. a typo'd --shel) is rejected rather
 # than silently forwarded. To pass options through to claude, separate them with
 # `--`, e.g. `claude-isol --local -- -p "hi" --model opus`. A bare prompt needs no
@@ -554,9 +574,14 @@ def _validate_volume(ctx, param, value):
 @click.option("-v", "--volume", "volumes", multiple=True, metavar="SRC:DST[:OPTS]",
               callback=_validate_volume,
               help="Extra mount, repeatable; works in both modes.")
+@click.option("--dev-bind", "dev_binds", multiple=True, metavar="SRC:DST",
+              callback=_validate_dev_bind,
+              help="Bind SRC onto DST with device access (GPUs at /dev/dri, "
+                   "/dev/bus/usb, ...), which a plain -v bind blocks; repeatable. "
+                   "--local only.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
-         mount_cwd_recursively, no_lan, volumes, claude_args):
+         mount_cwd_recursively, no_lan, volumes, dev_binds, claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -571,6 +596,8 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     if local and (image or install_claude or no_userns):
         raise click.UsageError(
             "--local cannot be combined with --image/--install-claude/--no-userns")
+    if dev_binds and not local:
+        raise click.UsageError("--dev-bind only applies to --local mode")
     if local and tmpfs_home:
         click.echo("note: --tmpfs-home is redundant under --local "
                    "(HOME is always a tmpfs there)", err=True)
@@ -598,7 +625,7 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
             # Move ourselves into the filtered cgroup; the exec'd bwrap (and its
             # whole tree) inherit the membership and thus the egress filter.
             (run_cg / "cgroup.procs").write_text(str(os.getpid()))
-        os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner, resolv))
+        os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner, resolv, dev_binds))
         return  # unreachable
 
     if image is None:

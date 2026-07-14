@@ -111,6 +111,9 @@ What it exposes:
 - Networking is shared with the host (Claude needs it to reach the API), and **all
   host environment variables are forwarded** unchanged.
 - Extra `-v src:dst[:ro]` mounts are honored (translated to bwrap binds).
+- `--dev-bind src:dst` (repeatable, `--local` only) binds a path **with device
+  access**, so device nodes work inside the sandbox — e.g. `--dev-bind /dev/dri`
+  for the GPU or `--dev-bind /dev/bus/usb` for USB. A plain `-v` bind blocks that.
 
 `--local --shell` drops into your shell (`$SHELL`, falling back to bash) inside the
 same sandbox (handy for inspecting what's exposed, or `gh auth login` against the
