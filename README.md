@@ -72,6 +72,11 @@ claude-isol --local                 # run on the host in a bubblewrap sandbox
 claude-isol --tmpfs-home            # mount HOME as a fresh tmpfs (ephemeral home)
 claude-isol -v /data:/data          # add extra mounts (repeatable, both modes)
 claude-isol -- -p "hi" --model opus # forward flags through to claude after `--`
+claude-isol --exec -- CMD ARG..     # run CMD in the sandbox instead of claude
+claude-isol -e VAR[=VAL]            # pass env into the container (repeatable;
+                                    # --local forwards the full env already)
+claude-isol --tcp-forward PORT      # container localhost:PORT -> host localhost:PORT
+                                    # (repeatable; --local shares the host net)
 ```
 
 Unknown options are **rejected** (so a typo'd flag is caught, not silently

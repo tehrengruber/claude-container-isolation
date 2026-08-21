@@ -571,6 +571,17 @@ def _validate_dev_bind(ctx, param, value):
 @click.option("--no-lan", is_flag=True,
               help="Block all traffic to local networks (the internet stays "
                    "reachable); DNS is pinned to a public resolver. Works in both modes.")
+@click.option("--exec", "exec_cmd", is_flag=True,
+              help="Run the trailing arguments as the command inside the sandbox "
+                   "instead of claude (e.g. `claude-isol --exec -- htop`).")
+@click.option("-e", "--env", "env_vars", multiple=True, metavar="VAR[=VAL]",
+              help="Pass an environment variable into the container (repeatable; "
+                   "a bare VAR forwards the host value). No-op under --local, "
+                   "which forwards the full host environment already.")
+@click.option("--tcp-forward", "tcp_forwards", multiple=True, type=int, metavar="PORT",
+              help="Forward localhost:PORT inside the container to host "
+                   "localhost:PORT (repeatable). No-op under --local, which "
+                   "shares the host network already.")
 @click.option("-v", "--volume", "volumes", multiple=True, metavar="SRC:DST[:OPTS]",
               callback=_validate_volume,
               help="Extra mount, repeatable; works in both modes.")
@@ -581,7 +592,8 @@ def _validate_dev_bind(ctx, param, value):
                    "--local only.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
-         mount_cwd_recursively, no_lan, volumes, dev_binds, claude_args):
+         mount_cwd_recursively, no_lan, exec_cmd, env_vars, tcp_forwards,
+         volumes, dev_binds, claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -592,6 +604,11 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
 
     if install_claude and not image:
         raise click.UsageError("--install-claude requires --image")
+
+    if exec_cmd and drop_shell:
+        raise click.UsageError("--exec cannot be combined with --shell")
+    if exec_cmd and not args:
+        raise click.UsageError("--exec requires a command after `--`")
 
     if local and (image or install_claude or no_userns):
         raise click.UsageError(
@@ -617,7 +634,12 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         # Scoped gh/git credentials, created on first run (shared with container mode).
         (HOME / ".config" / "gh-claude").mkdir(parents=True, exist_ok=True)
         (HOME / ".gitconfig-claude").touch(exist_ok=True)
-        inner = [os.environ.get("SHELL", "bash")] if drop_shell else ["claude", *args]
+        if drop_shell:
+            inner = [os.environ.get("SHELL", "bash")]
+        elif exec_cmd:
+            inner = args
+        else:
+            inner = ["claude", *args]
         resolv = None
         if no_lan:
             run_cg = setup_nolan_cgroup()
@@ -637,21 +659,24 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
 
     cwd = Path.cwd()
     confirm_cwd_submounts(cwd, mount_cwd_recursively)
-    ide_lock = None if drop_shell else find_ide_lock(cwd)
+    ide_lock = None if (drop_shell or exec_cmd) else find_ide_lock(cwd)
 
     # Without --userns=keep-id, container uid 0 maps to the host user, so HOME
     # inside the container is /root rather than the host home path.
     container_home = Path("/root") if no_userns else HOME
 
-    network = "pasta"
+    pasta_opts: list[str] = []
     extra_mounts: list[str] = []
 
     if ide_lock is not None:
         proxy_port = spawn_proxy(ide_lock.stem)
         tmp_ide = Path(tempfile.mkdtemp(prefix="claude-ide-"))
         shutil.copy(ide_lock, tmp_ide / f"{proxy_port}.lock")
-        network = f"pasta:-T,{proxy_port}"
+        pasta_opts.append(f"-T,{proxy_port}")
         extra_mounts = ["-v", f"{tmp_ide}:{container_home}/.claude/ide"]
+
+    pasta_opts.extend(f"-T,{port}" for port in tcp_forwards)
+    network = "pasta" + (":" + ",".join(pasta_opts) if pasta_opts else "")
 
     gh_config = HOME / ".config" / "gh-claude"
     gh_config.mkdir(parents=True, exist_ok=True)
@@ -662,7 +687,7 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     notify_mounts: list[str] = []
     notify_env: list[str] = []
     notify_args: list[str] = []
-    if not drop_shell:
+    if not drop_shell and not exec_cmd:
         notify_mounts, notify_env, notify_args = notify_wiring()
 
     tty_flag = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
@@ -713,9 +738,12 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         "-w", str(cwd),
         "-e", f"HOME={container_home}",
         "-e", "TERM",
+        *[arg for var in env_vars for arg in ("-e", var)],
         *notify_env,
         image,
-        *(["bash"] if drop_shell else ["claude", *notify_args, *args]),
+        *(["bash"] if drop_shell else
+          list(args) if exec_cmd else
+          ["claude", *notify_args, *args]),
     ]
 
     # Move ourselves into the filtered cgroup last, just before exec: with the
