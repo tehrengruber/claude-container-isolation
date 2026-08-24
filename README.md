@@ -157,6 +157,15 @@ systemctl --user enable --now claude-isol-notifyd
 
 After that, `claude-isol` auto-detects the daemon's socket and wires up
 notifications; with the daemon stopped it does nothing. `claude-isol-notifyd
---reset` clears the board (e.g. after a container was killed without exiting
-cleanly). Notifications require `python3` inside the image (the bundled image
-has it) and a running notification server on the host.
+--reset` clears the board. Notifications require `python3` inside the image (the
+bundled image has it) and a running notification server on the host.
+
+The board keeps itself short. Whenever it changes, lines that no longer carry
+information are dropped first: ones whose host process is gone (each event
+carries the pid of the `podman` process that owns the session, so a container
+killed without exiting cleanly doesn't linger) and ones silent for more than 5
+minutes (`--idle-timeout SECONDS`, `0` disables). This bounds how long the board
+gets; it is not a timer, so on a quiet board the last line stays until something
+happens — dismiss the notification if it's in your way. A render that would
+produce the exact same board as the last one is skipped, so an unchanged state
+never pops the notification back up.

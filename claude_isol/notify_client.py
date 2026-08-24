@@ -3,7 +3,9 @@
 
 Registered as the command for several Claude Code hook events inside the
 container. It does no interpretation: it reads the hook payload from stdin,
-wraps it together with this container's instance id, and writes one JSON line
+wraps it together with this container's instance id, the host pid of the
+process that owns the session (so the daemon can drop the line when the session
+dies) and the directory the session was launched in, then writes one JSON line
 to the host daemon's Unix socket. All event->state mapping happens host-side in
 `notifyd.py`.
 
@@ -28,7 +30,16 @@ def main() -> int:
     except Exception:
         return 0
 
-    line = json.dumps({"instance": instance, "hook": hook}) + "\n"
+    msg = {"instance": instance, "hook": hook}
+    label = os.environ.get("CLAUDE_ISOL_LABEL")
+    if label:
+        msg["label"] = label
+    try:
+        msg["pid"] = int(os.environ["CLAUDE_ISOL_HOST_PID"])
+    except (KeyError, ValueError):
+        pass
+
+    line = json.dumps(msg) + "\n"
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(1.0)

@@ -111,6 +111,13 @@ def notify_wiring() -> tuple[list[str], list[str], list[str]]:
     env = [
         "-e", f"CLAUDE_ISOL_NOTIFY_SOCK={NOTIFY_SOCK_CONTAINER}",
         "-e", f"CLAUDE_ISOL_INSTANCE={uuid.uuid4().hex}",
+        # We exec podman in-place further down, so our pid *is* the pid of the
+        # process that owns the session for its whole lifetime; the daemon watches
+        # it to drop the line when the session dies without a SessionEnd hook.
+        "-e", f"CLAUDE_ISOL_HOST_PID={os.getpid()}",
+        # The launch directory, as a stable label. The hook payload's own cwd
+        # wanders (subagents, tool calls) and would mislabel the line.
+        "-e", f"CLAUDE_ISOL_LABEL={Path.cwd().name or 'session'}",
     ]
     claude_args = ["--settings", json.dumps(notify_hooks_settings())]
     return mounts, env, claude_args
