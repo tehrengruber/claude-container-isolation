@@ -674,6 +674,7 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
 
     pasta_opts: list[str] = []
     extra_mounts: list[str] = []
+    ide_env: list[str] = []
 
     if ide_lock is not None:
         proxy_port = spawn_proxy(ide_lock.stem)
@@ -681,6 +682,12 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         shutil.copy(ide_lock, tmp_ide / f"{proxy_port}.lock")
         pasta_opts.append(f"-T,{proxy_port}")
         extra_mounts = ["-v", f"{tmp_ide}:{container_home}/.claude/ide"]
+        # Name the port out of band. Left to discover the IDE on its own, claude
+        # vets a lock file by signal-probing the pid recorded in it and walking the
+        # process tree looking for that pid -- both of which are answers only the
+        # host's pid namespace can give. Announcing the port instead satisfies the
+        # lookup directly, so the container keeps its own pid namespace.
+        ide_env = ["-e", f"CLAUDE_CODE_SSE_PORT={proxy_port}"]
 
     pasta_opts.extend(f"-T,{port}" for port in tcp_forwards)
     network = "pasta" + (":" + ",".join(pasta_opts) if pasta_opts else "")
@@ -733,7 +740,6 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         *nolan_flags,
         *userns_flag,
         *tmpfs_flag,
-        "--pid=host",
         "-v", f"{HOME}/.claude:{container_home}/.claude",
         *extra_mounts,
         "-v", f"{HOME}/.claude.json:{container_home}/.claude.json",
@@ -745,6 +751,7 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         "-w", str(cwd),
         "-e", f"HOME={container_home}",
         "-e", "TERM",
+        *ide_env,
         *[arg for var in env_vars for arg in ("-e", var)],
         *notify_env,
         image,

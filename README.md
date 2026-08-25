@@ -95,6 +95,20 @@ image ships under the home dir is wiped and nothing written there persists; the
 on top, so authentication survives. (Under `--local` the home is always a tmpfs,
 so the flag is a no-op there.)
 
+## IDE integration
+
+When a JetBrains IDE has registered an MCP endpoint for the current workspace
+(`~/.claude/ide/*.lock`), the launcher routes it through the filtering proxy: the
+proxy binds a fresh port, the lock file is copied under that port's name into the
+container's `~/.claude/ide`, and `pasta` forwards the port inward.
+
+That port is also announced to Claude via `CLAUDE_CODE_SSE_PORT`, which is what
+lets the container run in its own PID namespace. Left to find the endpoint on its
+own, Claude vets a lock file by signal-probing the pid recorded inside it and
+walking its process tree looking for that pid — questions only the host's PID
+namespace can answer. Naming the port satisfies the lookup directly, so host
+processes stay out of reach from inside the container.
+
 ## Local sandbox mode (`--local`)
 
 `claude-isol --local` skips podman entirely and runs the host's own Claude Code
