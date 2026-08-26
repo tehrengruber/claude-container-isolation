@@ -124,7 +124,14 @@ def interpret(hook: dict):
     """
     event = hook.get("hook_event_name")
 
+    if event == "PreCompact":
+        return ("upsert", "busy", "compacting…", False)
     if event == "SessionStart":
+        if hook.get("source") == "compact":
+            # A compact restarts the session where it left off — mid-turn, for an
+            # auto-compact. Resetting the line to idle would read as finished, so
+            # keep whatever state the session had, same as SessionEnd below.
+            return None
         return ("upsert", "idle", "started", False)
     if event == "UserPromptSubmit":
         return ("upsert", "busy", "working…", False)

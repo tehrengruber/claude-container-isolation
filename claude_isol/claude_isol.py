@@ -90,6 +90,7 @@ def notify_hooks_settings() -> dict:
             "SessionStart": hook(),
             "UserPromptSubmit": hook(),
             "PreToolUse": hook("*"),
+            "PreCompact": hook(),
             "Notification": hook(),
             "Stop": hook(),
             "SessionEnd": hook(),
