@@ -36,6 +36,8 @@ container, with an MCP-filtering proxy in front of the JetBrains IDE link.
 | `claude_isol/Dockerfile` | Arch-based image with `claude-code` installed from `arch-pre-built`. |
 | `claude_isol/notifyd.py` | Host notification daemon (`claude-isol-notifyd`); renders the status board over D-Bus. |
 | `claude_isol/notify_client.py` | In-container hook forwarder that reports session state to the daemon. |
+| `claude_isol/host_execd.py` | Host-side executor for `--host-exec`; prompts, then runs the command. |
+| `claude_isol/host_mcp.py` | In-container MCP server exposing the `mcp__host__run` tool. |
 | `pyproject.toml` | Python package definition (`pip install` entry point). |
 | `PKGBUILD` | Arch package definition for `claude-isol`. |
 
@@ -77,6 +79,8 @@ claude-isol -e VAR[=VAL]            # pass env into the container (repeatable;
                                     # --local forwards the full env already)
 claude-isol --tcp-forward PORT      # container localhost:PORT -> host localhost:PORT
                                     # (repeatable; --local shares the host net)
+claude-isol --host-exec             # let claude run commands on the host, each one
+                                    # confirmed in a dialog there (container mode)
 ```
 
 Unknown options are **rejected** (so a typo'd flag is caught, not silently
@@ -138,8 +142,40 @@ What it exposes:
 same sandbox (handy for inspecting what's exposed, or `gh auth login` against the
 scoped credentials).
 
-The JetBrains MCP proxy and host notifications are container-only and not wired up
-in `--local` mode.
+The JetBrains MCP proxy, host notifications and `--host-exec` are container-only
+and not wired up in `--local` mode.
+
+## Running on the host (`--host-exec`)
+
+Sometimes a task needs something the sandbox does not have — a device, a VPN
+route, a credential deliberately left outside. `--host-exec` gives the session a
+single MCP tool, `mcp__host__run`, that runs one shell command **on the host,
+outside the sandbox**, with `bash -lc` in the directory the session was launched
+from.
+
+Every call raises a confirmation dialog on the host showing the command
+verbatim, and nothing runs unless you approve it there:
+
+```sh
+claude-isol --host-exec
+```
+
+The dialog is the whole point. It is drawn by a small host-side daemon
+(`host_execd.py`) that owns the decision, so the gate holds even under
+`--dangerously-skip-permissions`: the session can ask, and can ask often, but it
+cannot answer. Requests are handled one at a time, and an unanswered prompt is
+denied after five minutes.
+
+Only the prompt is a boundary, not the transport. The socket is bind-mounted
+into the container, so anything in there can reach the daemon directly rather
+than going through the MCP tool — and it still lands in front of the same
+dialog. What the tool adds is a readable name for the capability, not a lock.
+
+The prompt is a `zenity` or `kdialog` dialog when either is installed, otherwise
+a desktop notification with **Run on host** / **Deny** buttons over the same
+D-Bus service the status board uses. If none of those can be reached — or the
+notification server does not support buttons — the request is denied rather than
+run unasked.
 
 ## Host notifications
 

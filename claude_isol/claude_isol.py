@@ -48,6 +48,14 @@ NOTIFY_SOCK_CONTAINER = "/run/claude-isol-notify.sock"
 NOTIFY_CLIENT_CONTAINER = "/opt/claude-isol/notify_client.py"
 NOTIFY_CLIENT_SRC = SCRIPT_DIR / "notify_client.py"
 
+# --host-exec wiring (see host_execd.py / host_mcp.py). The MCP server runs in the
+# container and forwards to the host daemon over a socket bind-mounted in; the
+# daemon prompts on the host before running anything.
+HOSTEXEC_SOCK_CONTAINER = "/run/claude-isol-hostexec.sock"
+HOSTEXEC_MCP_CONTAINER = "/opt/claude-isol/host_mcp.py"
+HOSTEXEC_MCP_SRC = SCRIPT_DIR / "host_mcp.py"
+HOSTEXEC_DAEMON_SRC = SCRIPT_DIR / "host_execd.py"
+
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
 
@@ -532,6 +540,57 @@ def spawn_proxy(ide_port: str) -> str:
     return port
 
 
+def spawn_hostexecd(cwd: Path, label: str) -> Path:
+    """Fork the host-side executor and return the socket it listens on.
+
+    Same shape as spawn_proxy: the child sets PR_SET_PDEATHSIG so the daemon is
+    torn down the moment the exec'd podman exits, and we wait for its ready line
+    -- podman needs the socket to exist before it can bind-mount it.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    sock = Path(runtime) / "claude-isol" / f"hostexec-{uuid.uuid4().hex}.sock"
+
+    ready_r, ready_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(ready_r)
+            os.dup2(ready_w, 1)
+            os.close(ready_w)
+            set_parent_death_signal(signal.SIGTERM)
+            os.execv(sys.executable, [
+                sys.executable, str(HOSTEXEC_DAEMON_SRC),
+                "--socket", str(sock),
+                "--cwd", str(cwd),
+                "--label", label,
+            ])
+        except BaseException as e:
+            os.write(2, f"host-execd exec failed: {e!r}\n".encode())
+        os._exit(127)
+
+    os.close(ready_w)
+    with os.fdopen(ready_r, "rb") as fr:
+        line = fr.readline()
+    if line.strip() != b"ready":
+        os.waitpid(pid, 0)
+        raise RuntimeError("host-execd failed to start")
+    return sock
+
+
+def hostexec_wiring(cwd: Path) -> tuple[list[str], list[str], list[str]]:
+    """Return (podman_mounts, podman_env, claude_args) for --host-exec."""
+    sock = spawn_hostexecd(cwd, cwd.name or "session")
+    mounts = [
+        "-v", f"{sock}:{HOSTEXEC_SOCK_CONTAINER}",
+        "-v", f"{HOSTEXEC_MCP_SRC}:{HOSTEXEC_MCP_CONTAINER}:ro",
+    ]
+    env = ["-e", f"CLAUDE_ISOL_HOSTEXEC_SOCK={HOSTEXEC_SOCK_CONTAINER}"]
+    mcp_config = {"mcpServers": {"host": {
+        "command": "python3", "args": [HOSTEXEC_MCP_CONTAINER],
+    }}}
+    return mounts, env, ["--mcp-config", json.dumps(mcp_config)]
+
+
 def _validate_volume(ctx, param, value):
     """Reject malformed -v specs up front: SRC:DST[:OPTS] (or a single PATH), with
     non-empty SRC/DST and at most one options field."""
@@ -590,6 +649,11 @@ def _validate_dev_bind(ctx, param, value):
               help="Forward localhost:PORT inside the container to host "
                    "localhost:PORT (repeatable). No-op under --local, which "
                    "shares the host network already.")
+@click.option("--host-exec", "host_exec", is_flag=True,
+              help="Give claude a tool that runs commands on the host, outside the "
+                   "sandbox. Every call raises a confirmation dialog on the host "
+                   "showing the command; nothing runs unless you approve it there. "
+                   "Container mode only.")
 @click.option("-v", "--volume", "volumes", multiple=True, metavar="SRC:DST[:OPTS]",
               callback=_validate_volume,
               help="Extra mount, repeatable; works in both modes.")
@@ -601,7 +665,7 @@ def _validate_dev_bind(ctx, param, value):
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
          mount_cwd_recursively, no_lan, exec_cmd, env_vars, tcp_forwards,
-         volumes, dev_binds, claude_args):
+         host_exec, volumes, dev_binds, claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -618,11 +682,17 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     if exec_cmd and not args:
         raise click.UsageError("--exec requires a command after `--`")
 
+    if host_exec and (drop_shell or exec_cmd):
+        # The tool is exposed to a claude session; there is none to expose it to.
+        raise click.UsageError("--host-exec cannot be combined with --shell/--exec")
+
     if local and (image or install_claude or no_userns):
         raise click.UsageError(
             "--local cannot be combined with --image/--install-claude/--no-userns")
     if dev_binds and not local:
         raise click.UsageError("--dev-bind only applies to --local mode")
+    if host_exec and local:
+        raise click.UsageError("--host-exec only applies to container mode")
     if local and tmpfs_home:
         click.echo("note: --tmpfs-home is redundant under --local "
                    "(HOME is always a tmpfs there)", err=True)
@@ -705,6 +775,12 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     if not drop_shell and not exec_cmd:
         notify_mounts, notify_env, notify_args = notify_wiring()
 
+    hostexec_mounts: list[str] = []
+    hostexec_env: list[str] = []
+    hostexec_args: list[str] = []
+    if host_exec:
+        hostexec_mounts, hostexec_env, hostexec_args = hostexec_wiring(cwd)
+
     tty_flag = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
     userns_flag = [] if no_userns else ["--userns=keep-id"]
     # A tmpfs HOME wipes whatever the image ships under the home dir; the config
@@ -749,16 +825,18 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         "-v", f"{cwd}:{cwd}",
         *[arg for spec in volumes for arg in ("-v", spec)],
         *notify_mounts,
+        *hostexec_mounts,
         "-w", str(cwd),
         "-e", f"HOME={container_home}",
         "-e", "TERM",
         *ide_env,
         *[arg for var in env_vars for arg in ("-e", var)],
         *notify_env,
+        *hostexec_env,
         image,
         *(["bash"] if drop_shell else
           list(args) if exec_cmd else
-          ["claude", *notify_args, *args]),
+          ["claude", *notify_args, *hostexec_args, *args]),
     ]
 
     # Move ourselves into the filtered cgroup last, just before exec: with the

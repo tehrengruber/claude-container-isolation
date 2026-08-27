@@ -8,6 +8,7 @@ arch=('any')
 license=('custom')
 depends=('podman' 'python' 'python-websockets' 'python-click' 'glib2')
 optdepends=('bubblewrap: for --local host-sandbox mode (no container)'
+            'zenity: confirmation dialogs for --host-exec (a desktop notification otherwise)'
             'libbpf: for --no-lan (block LAN, keep internet)'
             'systemd: for --no-lan in non-delegated sessions (SSH/TTY/IDE terminals)')
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel'
