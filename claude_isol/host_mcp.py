@@ -31,7 +31,16 @@ TOOL = {
         "confirmation dialog on the host showing the command verbatim, and "
         "nothing runs unless the user approves it there. Use it only for work "
         "that genuinely cannot happen inside the sandbox, and keep the command "
-        "short enough to read in a dialog."
+        "short enough to read in a dialog.\n\n"
+        "The call BLOCKS on that dialog: it returns as soon as the user answers, "
+        "but if they are away from the screen it can sit there for up to five "
+        "minutes before giving up and returning a denial. That is normal, not a "
+        "hang -- and the wait comes on top of however long the command itself "
+        "then takes. Send one call and wait for it. Do not fire off several in "
+        "parallel (they are prompted strictly one at a time, so they queue), and "
+        "do not re-send a denied command hoping for a different answer: a denial "
+        "is the user's decision, so tell them what you wanted to run and why "
+        "instead."
     ),
     "inputSchema": {
         "type": "object",
@@ -42,7 +51,9 @@ TOOL = {
             },
             "timeout": {
                 "type": "number",
-                "description": "Seconds the command may run for (default 600).",
+                "description": ("Seconds the command may run for once approved "
+                                "(default 600). The wait for the user's answer "
+                                "is separate and is not counted against it."),
             },
         },
         "required": ["command"],

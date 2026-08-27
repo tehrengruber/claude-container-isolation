@@ -55,6 +55,9 @@ HOSTEXEC_SOCK_CONTAINER = "/run/claude-isol-hostexec.sock"
 HOSTEXEC_MCP_CONTAINER = "/opt/claude-isol/host_mcp.py"
 HOSTEXEC_MCP_SRC = SCRIPT_DIR / "host_mcp.py"
 HOSTEXEC_DAEMON_SRC = SCRIPT_DIR / "host_execd.py"
+# Ceiling for one tool call: the dialog's own wait plus the longest command the
+# daemon will run (DIALOG_TIMEOUT + MAX_TIMEOUT in host_execd.py), with room to spare.
+HOSTEXEC_CALL_TIMEOUT_MS = 4_200_000
 
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
@@ -585,8 +588,15 @@ def hostexec_wiring(cwd: Path) -> tuple[list[str], list[str], list[str]]:
         "-v", f"{HOSTEXEC_MCP_SRC}:{HOSTEXEC_MCP_CONTAINER}:ro",
     ]
     env = ["-e", f"CLAUDE_ISOL_HOSTEXEC_SOCK={HOSTEXEC_SOCK_CONTAINER}"]
+    # A tool call blocks while the host dialog is up, so it needs a per-call
+    # timeout longer than the dialog can wait plus the command's own limit. The
+    # default is ample, but a low MCP_TOOL_TIMEOUT in the environment would apply
+    # here too, and a call cut off mid-prompt would still be approved and run on
+    # the host with nothing left to hand the result back to. A per-server timeout
+    # takes precedence over that variable, so pin it.
     mcp_config = {"mcpServers": {"host": {
         "command": "python3", "args": [HOSTEXEC_MCP_CONTAINER],
+        "timeout": HOSTEXEC_CALL_TIMEOUT_MS,
     }}}
     return mounts, env, ["--mcp-config", json.dumps(mcp_config)]
 
