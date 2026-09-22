@@ -387,15 +387,6 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
         elif p.is_dir():
             cmd += ["--ro-bind", d, d]
 
-    # Make sure the claude binary itself is reachable if it lives outside the
-    # dirs bound above (e.g. an npm-global install under /usr/local or elsewhere).
-    claude_bin = shutil.which("claude")
-    if claude_bin:
-        real = os.path.realpath(claude_bin)
-        if not any(real.startswith(p + "/") for p in ("/usr", "/opt", "/bin", "/sbin")):
-            d = os.path.dirname(real)
-            cmd += ["--ro-bind", d, d]
-
     # CA trust store: bind any trust anchors that live outside the system trees
     # already bound above (see _ca_trust_binds).
     cmd += _ca_trust_binds()
@@ -416,6 +407,25 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
         "--bind", f"{HOME}/.config/gh-claude", f"{home}/.config/gh",
         "--bind", f"{HOME}/.gitconfig-claude", f"{home}/.gitconfig",
     ]
+
+    # Make sure the claude binary itself is reachable when it lives outside the
+    # system dirs bound above -- an npm-global install under /usr/local, or a
+    # native one under HOME (~/.local/...). Two directories, because the one PATH
+    # found it in and the one it really lives in differ when the PATH entry is a
+    # symlink into a versioned install dir; bind only the target and the symlink
+    # itself is gone with the tmpfs, so PATH no longer resolves.
+    #
+    # After the tmpfs home, and for the same reason as the cwd below: an install
+    # under the home dir bound before it is simply shadowed, and the sandbox comes
+    # up with no claude in it at all ("bwrap: execvp claude: No such file or
+    # directory").
+    claude_bin = shutil.which("claude")
+    if claude_bin:
+        for d in dict.fromkeys((os.path.dirname(claude_bin),
+                                os.path.dirname(os.path.realpath(claude_bin)))):
+            if not any(d == p or d.startswith(p + "/")
+                       for p in ("/usr", "/opt", "/bin", "/sbin")):
+                cmd += ["--ro-bind", d, d]
 
     # The one read-write tree. Placed after the tmpfs home so a cwd under HOME
     # still wins by bwrap's last-wins ordering.
