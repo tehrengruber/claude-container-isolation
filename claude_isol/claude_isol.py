@@ -84,6 +84,35 @@ def find_ide_lock(cwd: Path) -> Optional[Path]:
     return None
 
 
+def _prompt_index(args: list[str]) -> Optional[int]:
+    """Index of the prompt positional, when it can be picked out without knowing
+    claude's whole option table: the only non-option argument, or the token right
+    after `-p`/`--print`, which is a boolean flag. None when it is ambiguous."""
+    positionals = [i for i, a in enumerate(args) if not a.startswith("-")]
+    if len(positionals) == 1:
+        return positionals[0]
+    return next((i for i in positionals if args[i - 1] in ("-p", "--print")), None)
+
+
+def prompt_from_file(path: Path, args: list[str],
+                     dst: str) -> tuple[list[str], Optional[str], Optional[str]]:
+    """Wire up an opening prompt read from `path`, keeping it off every command
+    line -- the launcher's, claude's, and the shell history of whoever starts it.
+
+    Print mode takes it on stdin, where it arrives as the prompt exactly as
+    written. An interactive session has no such channel (the TUI owns stdin), so
+    the file is bound in at `dst` and referenced as `@dst`; claude expands that
+    inline when it builds the message, without the Read tool and without a
+    permission prompt. Returns (args, stdin text, mount spec).
+    """
+    text = path.read_text()
+    if not text.strip():
+        raise click.UsageError(f"--prompt-file: {path} is empty")
+    if any(a in ("-p", "--print") for a in args) and sys.stdin.isatty():
+        return args, text, None
+    return [*args, f"@{dst}"], None, f"{path}:{dst}:ro"
+
+
 def prompt_off_argv(args: list[str]) -> tuple[list[str], Optional[str]]:
     """Pull the prompt out of a print-mode arg list so it can go in on stdin.
 
@@ -105,12 +134,7 @@ def prompt_off_argv(args: list[str]) -> tuple[list[str], Optional[str]]:
     if not any(a in ("-p", "--print") for a in args):
         return args, None  # interactive: claude takes the opening prompt in argv only
 
-    positionals = [i for i, a in enumerate(args) if not a.startswith("-")]
-    idx = None
-    if len(positionals) == 1:
-        idx = positionals[0]
-    else:
-        idx = next((i for i in positionals if args[i - 1] in ("-p", "--print")), None)
+    idx = _prompt_index(args)
     if idx is None:
         return args, None
     return args[:idx] + args[idx + 1:], args[idx]
@@ -716,6 +740,11 @@ def _validate_dev_bind(ctx, param, value):
                    "sandbox. Every call raises a confirmation dialog on the host "
                    "showing the command; nothing runs unless you approve it there. "
                    "Container mode only.")
+@click.option("--prompt-file", "prompt_file", metavar="PATH",
+              type=click.Path(exists=True, dir_okay=False, path_type=Path),
+              help="Take the opening prompt from PATH, so it never appears in a "
+                   "command line or in shell history. Fed in on stdin in print "
+                   "mode; bound in and passed as an @-reference otherwise.")
 @click.option("-v", "--volume", "volumes", multiple=True, metavar="SRC:DST[:OPTS]",
               callback=_validate_volume,
               help="Extra mount, repeatable; works in both modes.")
@@ -727,7 +756,7 @@ def _validate_dev_bind(ctx, param, value):
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
          mount_cwd_recursively, no_lan, exec_cmd, env_vars, tcp_forwards,
-         host_exec, volumes, dev_binds, claude_args):
+         host_exec, prompt_file, volumes, dev_binds, claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -743,6 +772,14 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         raise click.UsageError("--exec cannot be combined with --shell")
     if exec_cmd and not args:
         raise click.UsageError("--exec requires a command after `--`")
+
+    if prompt_file is not None:
+        if drop_shell or exec_cmd:
+            raise click.UsageError(
+                "--prompt-file cannot be combined with --shell/--exec")
+        if _prompt_index(args) is not None:
+            raise click.UsageError(
+                "--prompt-file conflicts with the prompt given as an argument")
 
     if host_exec and (drop_shell or exec_cmd):
         # The tool is exposed to a claude session; there is none to expose it to.
@@ -780,7 +817,16 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         elif exec_cmd:
             inner = args
         else:
-            args, prompt = prompt_off_argv(args)
+            if prompt_file is not None:
+                # The sandbox keeps host paths, so the file is referenced where it
+                # already lives; the bind rides in with the user -v specs, which are
+                # emitted after the tmpfs HOME and so survive a prompt file under it.
+                src = str(prompt_file.resolve())
+                args, prompt, mount = prompt_from_file(prompt_file, args, src)
+                if mount is not None:
+                    volumes.append(mount)
+            else:
+                args, prompt = prompt_off_argv(args)
             inner = ["claude", *args]
         resolv = None
         if no_lan:
@@ -805,7 +851,13 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     confirm_cwd_submounts(cwd, mount_cwd_recursively)
     prompt = None
     if not drop_shell and not exec_cmd:
-        args, prompt = prompt_off_argv(args)
+        if prompt_file is not None:
+            dst = f"/run/claude-isol-prompt{prompt_file.suffix}"
+            args, prompt, mount = prompt_from_file(prompt_file, args, dst)
+            if mount is not None:
+                volumes.append(mount)
+        else:
+            args, prompt = prompt_off_argv(args)
     ide_lock = None if (drop_shell or exec_cmd) else find_ide_lock(cwd)
 
     # Without --userns=keep-id, container uid 0 maps to the host user, so HOME

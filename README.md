@@ -81,6 +81,8 @@ claude-isol --tcp-forward PORT      # container localhost:PORT -> host localhost
                                     # (repeatable; --local shares the host net)
 claude-isol --host-exec             # let claude run commands on the host, each one
                                     # confirmed in a dialog there (container mode)
+claude-isol --prompt-file task.md   # opening prompt from a file, so it never
+                                    # lands in a command line or shell history
 ```
 
 Unknown options are **rejected** (so a typo'd flag is caught, not silently
@@ -119,8 +121,27 @@ layouts are left as they are rather than risked, and a prompt the caller pipes i
 is never overwritten.
 
 An interactive session's opening prompt (`claude-isol "fix the bug"`) stays on the
-command line — claude accepts that one only as an argument. On a shared machine,
-type it into the TUI instead.
+command line: claude accepts that one only as an argument, and by then you have
+typed it on your own command line anyway, where `ps` and the shell history can
+both see it.
+
+`--prompt-file` is the way around that — write the prompt to a file and it never
+reaches a command line at all, yours included:
+
+```sh
+claude-isol --prompt-file task.md          # interactive, opening prompt from the file
+claude-isol --prompt-file task.md -- -p    # print mode, same file
+```
+
+In print mode the file's text goes in on stdin, exactly as if you had typed it.
+Interactively there is no such channel — the TUI owns stdin — so the file is
+bound into the sandbox read-only and passed as `@path`, which claude expands
+inline when it builds the message (no `Read` tool, no permission prompt). The
+command line then carries the path and nothing else. Note that this makes the
+opening message a file reference with the contents attached, rather than the text
+as your own words, so a prompt that reads oddly when quoted may land differently.
+When the caller is already piping something into a print-mode session, the
+`@path` form is used there too so the pipe is left alone.
 
 ## IDE integration
 
