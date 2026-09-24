@@ -99,6 +99,29 @@ image ships under the home dir is wiped and nothing written there persists; the
 on top, so authentication survives. (Under `--local` the home is always a tmpfs,
 so the flag is a no-op there.)
 
+### Prompts and `ps`
+
+A command line is public: `/proc/<pid>/cmdline` is world-readable, so on a shared
+machine anything passed as an argument can be read by every other user for as
+long as the session runs — in the launcher's process, and again in claude's,
+which is an ordinary host process in both modes.
+
+A print-mode prompt is therefore handed to claude on **stdin** rather than on the
+command line, and never reaches an argv at all:
+
+```sh
+claude-isol -- -p "something confidential"
+```
+
+The prompt is moved when it can be identified without guesswork: when it is the
+only non-option argument, or when it directly follows `-p`/`--print`. Other
+layouts are left as they are rather than risked, and a prompt the caller pipes in
+is never overwritten.
+
+An interactive session's opening prompt (`claude-isol "fix the bug"`) stays on the
+command line — claude accepts that one only as an argument. On a shared machine,
+type it into the TUI instead.
+
 ## IDE integration
 
 When a JetBrains IDE has registered an MCP endpoint for the current workspace

@@ -84,6 +84,48 @@ def find_ide_lock(cwd: Path) -> Optional[Path]:
     return None
 
 
+def prompt_off_argv(args: list[str]) -> tuple[list[str], Optional[str]]:
+    """Pull the prompt out of a print-mode arg list so it can go in on stdin.
+
+    A command line is public: /proc/<pid>/cmdline is world-readable, so a prompt
+    passed as an argument is visible to every user on the machine in `ps ax` for
+    as long as the session runs -- in the launcher's own argv, and again in
+    claude's, which is a plain host process even in container mode. Print mode
+    reads the prompt from stdin when it isn't given one, which keeps it out of
+    both. Returns (args without the prompt, the prompt).
+
+    Only unambiguous cases are claimed. Telling a positional from an option's
+    value in general would mean knowing claude's whole option table, so the
+    prompt is taken when it is the only non-option argument, or when it directly
+    follows `-p`/`--print` -- a boolean flag, so the next token is a positional.
+    Anything else is left where it is rather than risked.
+    """
+    if not sys.stdin.isatty():
+        return args, None  # stdin already carries something; not ours to take
+    if not any(a in ("-p", "--print") for a in args):
+        return args, None  # interactive: claude takes the opening prompt in argv only
+
+    positionals = [i for i, a in enumerate(args) if not a.startswith("-")]
+    idx = None
+    if len(positionals) == 1:
+        idx = positionals[0]
+    else:
+        idx = next((i for i in positionals if args[i - 1] in ("-p", "--print")), None)
+    if idx is None:
+        return args, None
+    return args[:idx] + args[idx + 1:], args[idx]
+
+
+def stdin_from_text(text: str) -> None:
+    """Point stdin at an unlinked temp file holding `text`, just before exec, so
+    the child reads it as piped input and it never lands in a command line."""
+    tmp = tempfile.TemporaryFile()
+    tmp.write(text.encode())
+    tmp.flush()
+    os.lseek(tmp.fileno(), 0, os.SEEK_SET)
+    os.dup2(tmp.fileno(), 0)
+
+
 def notify_hooks_settings() -> dict:
     """Hook config injected via `claude --settings` so the in-container session
     reports its state to the host daemon. Every event runs the same forwarder;
@@ -732,11 +774,13 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         # Scoped gh/git credentials, created on first run (shared with container mode).
         (HOME / ".config" / "gh-claude").mkdir(parents=True, exist_ok=True)
         (HOME / ".gitconfig-claude").touch(exist_ok=True)
+        prompt = None
         if drop_shell:
             inner = [os.environ.get("SHELL", "bash")]
         elif exec_cmd:
             inner = args
         else:
+            args, prompt = prompt_off_argv(args)
             inner = ["claude", *args]
         resolv = None
         if no_lan:
@@ -745,6 +789,8 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
             # Move ourselves into the filtered cgroup; the exec'd bwrap (and its
             # whole tree) inherit the membership and thus the egress filter.
             (run_cg / "cgroup.procs").write_text(str(os.getpid()))
+        if prompt is not None:
+            stdin_from_text(prompt)
         os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner, resolv, dev_binds))
         return  # unreachable
 
@@ -757,6 +803,9 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
 
     cwd = Path.cwd()
     confirm_cwd_submounts(cwd, mount_cwd_recursively)
+    prompt = None
+    if not drop_shell and not exec_cmd:
+        args, prompt = prompt_off_argv(args)
     ide_lock = None if (drop_shell or exec_cmd) else find_ide_lock(cwd)
 
     # Without --userns=keep-id, container uid 0 maps to the host user, so HOME
@@ -801,7 +850,10 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     if host_exec:
         hostexec_mounts, hostexec_env, hostexec_args = hostexec_wiring(cwd)
 
-    tty_flag = ["-t"] if sys.stdin.isatty() and sys.stdout.isatty() else []
+    # No pty when the prompt is arriving on stdin: -t would put one between the
+    # pipe and claude, and claude reads a tty as an interactive session.
+    tty_flag = (["-t"] if prompt is None and sys.stdin.isatty() and sys.stdout.isatty()
+                else [])
     userns_flag = [] if no_userns else ["--userns=keep-id"]
     # A tmpfs HOME wipes whatever the image ships under the home dir; the config
     # bind mounts below are layered on top (podman orders mounts parent-first).
@@ -864,6 +916,9 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     # container beneath it, so the egress filter is inherited by the lot.
     if nolan_cg is not None:
         (nolan_cg / "cgroup.procs").write_text(str(os.getpid()))
+
+    if prompt is not None:
+        stdin_from_text(prompt)
 
     os.execvp("podman", cmd)
     return  # unreachable
