@@ -28,4 +28,14 @@ RUN CBM_CACHE_DIR=/tmp/cbm-install curl -fsSL \
  && rm -rf /tmp/cbm-install \
  && /usr/local/bin/codebase-memory-mcp --version
 
+# Index per invocation, shared with nobody. /tmp is the container's own writable
+# layer, so the cache starts empty every run and dies with the container -- which
+# is what this server wants: its coordination state (locks, daemon socket) lives
+# in /tmp/cbm-daemon-<uid> and is per-container for the same reason, so two
+# sessions sharing one cache dir would be two daemons each assuming it is the
+# only one. Created here because the container user cannot write under the
+# root-owned HOME, where the default ~/.cache/codebase-memory-mcp would land.
+RUN mkdir -p /tmp/codebase-memory && chmod 1777 /tmp/codebase-memory
+ENV CBM_CACHE_DIR=/tmp/codebase-memory
+
 CMD ["/bin/bash"]
