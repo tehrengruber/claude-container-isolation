@@ -71,7 +71,8 @@ claude-isol --shell                 # drop into bash inside the container
                                     # (handy for `gh auth login` etc.)
 claude-isol --image NAME            # run a prebuilt image as-is
 claude-isol --local                 # run on the host in a bubblewrap sandbox
-claude-isol --tmpfs-home            # mount HOME as a fresh tmpfs (ephemeral home)
+claude-isol --tmpfs-home            # mount HOME as a fresh tmpfs (ephemeral home;
+                                    # under --local, keeps HOME writable)
 claude-isol -v /data:/data          # add extra mounts (repeatable, both modes)
 claude-isol -- -p "hi" --model opus # forward flags through to claude after `--`
 claude-isol --exec -- CMD ARG..     # run CMD in the sandbox instead of claude
@@ -101,15 +102,22 @@ and never built — bring your own.
 `--tmpfs-home` mounts the container's HOME as a fresh tmpfs, so anything the
 image ships under the home dir is wiped and nothing written there persists; the
 `~/.claude`, `~/.claude.json` and scoped `gh`/`git` config are still bind-mounted
-on top, so authentication survives. (Under `--local` the home is always a tmpfs,
-so the flag is a no-op there.)
+on top, so authentication survives. Under `--local` the home is always a fresh
+tmpfs, and there the flag means something else: it leaves that home **writable**
+instead of read-only (see below).
 
 ### Writable paths inside HOME
 
-By default the container's HOME is the image's own directory — owned by root and
-read-only to the session — with just those four config paths bind-mounted on top.
-Nothing else under HOME can even be created, so a tool that wants `~/.cache`,
-`~/.npm` or `~/.local/share` fails outright.
+HOME is read-only in both modes. In container mode that comes for free: HOME is
+the image's own directory, owned by root, with just those four config paths
+bind-mounted on top. Under `--local` the same shape is built deliberately — HOME
+is a fresh tmpfs that is remounted read-only once everything has been mounted
+into it, so the config binds and the working directory stay writable while HOME
+itself is not. The mount is read-only, not merely unwritable by mode, so nothing
+in the sandbox can `chmod` its way out.
+
+Either way, nothing else under HOME can even be created, so a tool that wants
+`~/.cache`, `~/.npm` or `~/.local/share` fails outright.
 
 `--tmpfs-home-subdirectory` opens up only the paths you name, as tmpfs mounts,
 leaving the rest of HOME as it was:
@@ -122,9 +130,11 @@ claude-isol --tmpfs-home-subdirectory .cache --tmpfs-home-subdirectory .local/sh
 Paths are relative to HOME (an absolute path inside HOME is accepted too; one
 outside it is rejected — that is what `-v` is for). Each mount is writable by the
 session and allows execution, matching `/tmp`, and its contents are discarded
-when the container exits — so it is scratch space, not storage; use `-v` for
-anything that has to survive. Container mode only: under `--local` all of HOME is
-already a writable tmpfs.
+when the session ends — so it is scratch space, not storage; use `-v` for
+anything that has to survive. Works in both modes.
+
+To go the other way and have a fully writable home, use `--tmpfs-home` under
+`--local`.
 
 ### Prompts and `ps`
 

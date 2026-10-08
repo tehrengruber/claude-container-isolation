@@ -428,7 +428,9 @@ def _passwd_group_binds() -> list[str]:
 
 def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
                     resolv: Optional[Path] = None,
-                    dev_binds: Optional[list[str]] = None) -> list[str]:
+                    dev_binds: Optional[list[str]] = None,
+                    home_subdirs: tuple[str, ...] = (),
+                    writable_home: bool = False) -> list[str]:
     """Build the `bwrap` argv for --local mode: a host sandbox that exposes only the
     minimal system dirs read-only, a fresh ephemeral HOME with just the Claude config
     bound in, and the cwd as the single read-write tree. `inner` is the command run
@@ -473,6 +475,12 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
         "--bind", f"{HOME}/.config/gh-claude", f"{home}/.config/gh",
         "--bind", f"{HOME}/.gitconfig-claude", f"{home}/.gitconfig",
     ]
+
+    # Writable scratch inside the otherwise read-only HOME (see the --remount-ro at
+    # the end). A bwrap tmpfs comes up owned by the sandbox user, so unlike podman's
+    # it needs no mode of its own.
+    for rel in home_subdirs:
+        cmd += ["--tmpfs", f"{home}/{rel}"]
 
     # Make sure the claude binary itself is reachable when it lives outside the
     # system dirs bound above -- an npm-global install under /usr/local, or a
@@ -538,6 +546,16 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
         cmd += ["--ro-bind", str(src), target]
     elif resolv is not None:
         cmd += ["--ro-bind", str(resolv), etc_resolv]
+
+    # HOME read-only, to match container mode, where HOME is the image's root-owned
+    # directory and only the config paths bound over it are writable. Everything
+    # mounted *into* HOME above -- the config binds, the cwd, --tmpfs-home-subdirectory,
+    # a claude install under the home dir -- is a mount of its own and stays writable:
+    # --remount-ro is not recursive. It has to come after all of them, since mounting
+    # anything needs a writable mountpoint, and it makes the mount itself read-only
+    # rather than just the mode bits, so nothing in the sandbox can chmod its way out.
+    if not writable_home:
+        cmd += ["--remount-ro", home]
 
     cmd += [
         "--chdir", str(cwd),
@@ -737,14 +755,14 @@ def _validate_dev_bind(ctx, param, value):
 @click.option("--local", is_flag=True,
               help="Run on the host under a bubblewrap sandbox (no container).")
 @click.option("--tmpfs-home", is_flag=True,
-              help="Mount HOME as a fresh tmpfs (already the default under --local).")
+              help="Mount HOME as a fresh tmpfs. Under --local HOME is always a fresh "
+                   "tmpfs; there this flag leaves it writable instead of read-only.")
 @click.option("--tmpfs-home-subdirectory", "home_subdirs", multiple=True,
               metavar="PATH[,PATH...]", callback=_validate_home_subdir,
               help="Mount a writable tmpfs at PATH inside HOME, leaving the rest of "
                    "HOME alone. Repeatable and comma-separated; paths are relative "
-                   "to HOME (e.g. .cache,.npm). Contents are discarded with the "
-                   "container. Container mode only -- HOME is already a writable "
-                   "tmpfs under --local.")
+                   "to HOME (e.g. .cache,.npm). Contents are discarded when the "
+                   "session ends. Works in both modes.")
 @click.option("--mount-cwd-recursively", is_flag=True,
               help="Skip the confirmation prompted when filesystems are mounted under "
                    "the working directory. The cwd is always bound recursively (rootless "
@@ -821,12 +839,6 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         raise click.UsageError("--dev-bind only applies to --local mode")
     if host_exec and local:
         raise click.UsageError("--host-exec only applies to container mode")
-    if local and tmpfs_home:
-        click.echo("note: --tmpfs-home is redundant under --local "
-                   "(HOME is always a tmpfs there)", err=True)
-    if local and home_subdirs:
-        click.echo("note: --tmpfs-home-subdirectory is redundant under --local "
-                   "(all of HOME is already a writable tmpfs there)", err=True)
 
     # --no-lan creates a per-run cgroup; if our terminal's cgroup isn't delegated
     # (PyCharm/SSH/TTY), re-exec into a delegated scope first. No-op otherwise.
@@ -869,7 +881,8 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
             (run_cg / "cgroup.procs").write_text(str(os.getpid()))
         if prompt is not None:
             stdin_from_text(prompt)
-        os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner, resolv, dev_binds))
+        os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner, resolv, dev_binds,
+                                           home_subdirs, tmpfs_home))
         return  # unreachable
 
     if image is None:
