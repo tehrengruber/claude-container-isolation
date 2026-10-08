@@ -18,4 +18,14 @@ RUN pacman -Syu --noconfirm claude-code git github-cli python python310 python31
  && echo 'ALL ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/00-claude-isol \
  && chmod 0440 /etc/sudoers.d/00-claude-isol
 
+# codebase-memory-mcp: a single static binary, no runtime and no network needed
+# once installed. --skip-config because the client config comes from the mounted
+# ~/.claude.json or --mcp-config, not from anything baked in here; CBM_CACHE_DIR
+# keeps the installer's own bookkeeping out of /root/.cache.
+RUN CBM_CACHE_DIR=/tmp/cbm-install curl -fsSL \
+        https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh \
+      | CBM_CACHE_DIR=/tmp/cbm-install bash -s -- --dir /usr/local/bin --skip-config \
+ && rm -rf /tmp/cbm-install \
+ && /usr/local/bin/codebase-memory-mcp --version
+
 CMD ["/bin/bash"]
