@@ -688,6 +688,28 @@ def _validate_volume(ctx, param, value):
     return value
 
 
+def _validate_home_subdir(ctx, param, value):
+    """Normalize --tmpfs-home-subdirectory specs to paths relative to HOME.
+
+    Takes comma-separated lists as well as repetition, and either a relative path
+    (`.cache`) or an absolute one under HOME (`~/.cache`, already expanded by the
+    shell). A path outside HOME is rejected -- that is what -v is for -- and so is
+    HOME itself, which is --tmpfs-home."""
+    out: list[str] = []
+    for spec in value:
+        for raw in (s.strip() for s in spec.split(",")):
+            if not raw:
+                continue
+            p = os.path.normpath(os.path.join(str(HOME), os.path.expanduser(raw)))
+            if p == str(HOME) or not p.startswith(str(HOME) + os.sep):
+                raise click.BadParameter(
+                    f"{raw!r}: expected a path inside HOME, e.g. .cache", param=param)
+            rel = os.path.relpath(p, str(HOME))
+            if rel not in out:
+                out.append(rel)
+    return tuple(out)
+
+
 def _validate_dev_bind(ctx, param, value):
     """Reject malformed --dev-bind specs: SRC:DST (or a single PATH), both non-empty.
     Unlike -v there is no options field (a device bind is always read-write)."""
@@ -716,6 +738,13 @@ def _validate_dev_bind(ctx, param, value):
               help="Run on the host under a bubblewrap sandbox (no container).")
 @click.option("--tmpfs-home", is_flag=True,
               help="Mount HOME as a fresh tmpfs (already the default under --local).")
+@click.option("--tmpfs-home-subdirectory", "home_subdirs", multiple=True,
+              metavar="PATH[,PATH...]", callback=_validate_home_subdir,
+              help="Mount a writable tmpfs at PATH inside HOME, leaving the rest of "
+                   "HOME alone. Repeatable and comma-separated; paths are relative "
+                   "to HOME (e.g. .cache,.npm). Contents are discarded with the "
+                   "container. Container mode only -- HOME is already a writable "
+                   "tmpfs under --local.")
 @click.option("--mount-cwd-recursively", is_flag=True,
               help="Skip the confirmation prompted when filesystems are mounted under "
                    "the working directory. The cwd is always bound recursively (rootless "
@@ -756,7 +785,7 @@ def _validate_dev_bind(ctx, param, value):
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
          mount_cwd_recursively, no_lan, exec_cmd, env_vars, tcp_forwards,
-         host_exec, prompt_file, volumes, dev_binds, claude_args):
+         host_exec, prompt_file, home_subdirs, volumes, dev_binds, claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -795,6 +824,9 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     if local and tmpfs_home:
         click.echo("note: --tmpfs-home is redundant under --local "
                    "(HOME is always a tmpfs there)", err=True)
+    if local and home_subdirs:
+        click.echo("note: --tmpfs-home-subdirectory is redundant under --local "
+                   "(all of HOME is already a writable tmpfs there)", err=True)
 
     # --no-lan creates a per-run cgroup; if our terminal's cgroup isn't delegated
     # (PyCharm/SSH/TTY), re-exec into a delegated scope first. No-op otherwise.
@@ -911,6 +943,17 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
     # bind mounts below are layered on top (podman orders mounts parent-first).
     tmpfs_flag = ["--tmpfs", str(container_home)] if tmpfs_home else []
 
+    # Writable scratch inside an otherwise untouched HOME. Without this, HOME in the
+    # container is the image's root-owned directory with only the config paths bound
+    # over it, so a tool that wants ~/.cache or ~/.npm cannot even create it. podman
+    # orders mounts parent-first, so these land on top of a tmpfs HOME as well.
+    # mode=1777 because the tmpfs is created root-owned and the session runs as the
+    # mapped user; exec so it matches /tmp (podman's tmpfs default is noexec).
+    home_subdir_flags = [
+        arg for rel in home_subdirs
+        for arg in ("--tmpfs", f"{container_home / rel}:rw,exec,mode=1777")
+    ]
+
     # --no-lan: run the whole podman process tree under a cgroup that carries the
     # egress filter, and pin DNS to the public resolver.
     #
@@ -941,6 +984,7 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         *nolan_flags,
         *userns_flag,
         *tmpfs_flag,
+        *home_subdir_flags,
         "-v", f"{HOME}/.claude:{container_home}/.claude",
         *extra_mounts,
         "-v", f"{HOME}/.claude.json:{container_home}/.claude.json",

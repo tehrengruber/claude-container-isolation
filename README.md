@@ -83,6 +83,9 @@ claude-isol --host-exec             # let claude run commands on the host, each 
                                     # confirmed in a dialog there (container mode)
 claude-isol --prompt-file task.md   # opening prompt from a file, so it never
                                     # lands in a command line or shell history
+claude-isol --tmpfs-home-subdirectory .cache,.npm
+                                    # writable tmpfs at those paths inside HOME,
+                                    # the rest of HOME left as it is
 ```
 
 Unknown options are **rejected** (so a typo'd flag is caught, not silently
@@ -100,6 +103,28 @@ image ships under the home dir is wiped and nothing written there persists; the
 `~/.claude`, `~/.claude.json` and scoped `gh`/`git` config are still bind-mounted
 on top, so authentication survives. (Under `--local` the home is always a tmpfs,
 so the flag is a no-op there.)
+
+### Writable paths inside HOME
+
+By default the container's HOME is the image's own directory — owned by root and
+read-only to the session — with just those four config paths bind-mounted on top.
+Nothing else under HOME can even be created, so a tool that wants `~/.cache`,
+`~/.npm` or `~/.local/share` fails outright.
+
+`--tmpfs-home-subdirectory` opens up only the paths you name, as tmpfs mounts,
+leaving the rest of HOME as it was:
+
+```sh
+claude-isol --tmpfs-home-subdirectory .cache,.npm
+claude-isol --tmpfs-home-subdirectory .cache --tmpfs-home-subdirectory .local/share
+```
+
+Paths are relative to HOME (an absolute path inside HOME is accepted too; one
+outside it is rejected — that is what `-v` is for). Each mount is writable by the
+session and allows execution, matching `/tmp`, and its contents are discarded
+when the container exits — so it is scratch space, not storage; use `-v` for
+anything that has to survive. Container mode only: under `--local` all of HOME is
+already a writable tmpfs.
 
 ### Prompts and `ps`
 
