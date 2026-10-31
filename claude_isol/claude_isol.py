@@ -916,5 +916,3 @@ def main(drop_shell, image, install_claude, no_userns, local, vm, vm_memory,
     backends.launch(spec)
     return  # unreachable: the backend exec's
 
-if __name__ == "__main__":
-    main()
