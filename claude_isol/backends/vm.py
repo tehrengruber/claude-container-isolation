@@ -86,6 +86,7 @@ SSH_PROXY = "/usr/lib/systemd/systemd-ssh-proxy"
 VFSD_SYSTEM_DIRS = ("/usr", "/etc", "/opt")
 BOOT_TIMEOUT = 90.0        # generous: a cold page cache plus systemd
 SSH_RETRY_DELAY = 0.3
+PROBE_TIMEOUT = 10.0       # one connection attempt, so the loop keeps progressing
 
 
 def _run_dir(run_id: str) -> Path:
@@ -420,7 +421,15 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
         if gone:
             raise click.UsageError(
                 f"qemu exited before the VM came up (cid {cid} already in use?)")
-        r = subprocess.run(probe, capture_output=True, text=True)
+        try:
+            # A probe that blocks forever would stop the loop ever reaching the
+            # deadline again, turning a failure into an indefinite hang -- which
+            # is what a vsock connect to a guest that never answers does.
+            r = subprocess.run(probe, capture_output=True, text=True,
+                               timeout=PROBE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            last = [f"ssh did not return within {PROBE_TIMEOUT:g}s"]
+            continue
         if r.returncode == 0:
             if r.stdout.strip() == token:
                 return
