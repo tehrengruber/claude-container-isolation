@@ -378,7 +378,11 @@ def _qemu_argv(spec: Launch, disk: Path, kernel: Path, initrd: Path,
         # The guest's ssh key, delivered as a systemd credential.
         "-smbios",
         f"type=11,value=io.systemd.credential:ssh.ephemeral-authorized_keys-all={pubkey}",
-        "-serial", "null", "-monitor", "none",
+        # The guest's console goes to a file in the image cache, not to our
+        # terminal (ssh owns that) and not to /dev/null. When a boot fails there
+        # is otherwise nothing to look at: the session just never answers.
+        "-serial", f"file:{vm_image.cache_dir() / 'last-console.log'}",
+        "-monitor", "none",
     ]
     for tag, sock in socks.items():
         argv += ["-chardev", f"socket,id=vfs-{tag},path={sock}",
@@ -416,7 +420,8 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
                 "refusing to hand it the session")
         time.sleep(SSH_RETRY_DELAY)
     raise click.UsageError(
-        f"the VM did not answer on vsock/{cid} within {BOOT_TIMEOUT:g}s")
+        f"the VM did not answer on vsock/{cid} within {BOOT_TIMEOUT:g}s; the "
+        f"guest console is in {vm_image.cache_dir() / 'last-console.log'}")
 
 
 def _ssh_argv(key: Path, cid: int) -> list[str]:
