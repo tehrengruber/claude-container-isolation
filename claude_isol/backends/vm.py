@@ -440,11 +440,16 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
 
 def _ssh_argv(key: Path, cid: int) -> list[str]:
     return [
-        # -F /dev/null so the user's ssh_config cannot redirect this connection
-        # (a `Host *` ProxyCommand would). That also discards the system-wide
-        # drop-in systemd ships -- which is the only thing that teaches ssh what
-        # a vsock/<cid> host *is* -- so its two options are passed explicitly.
-        # Without them ssh treats "vsock/<cid>" as a hostname and tries DNS.
+        # -F /dev/null because ssh takes the first value it obtains for each
+        # option and reads the per-user file before the system one: a `Host *`
+        # stanza in ~/.ssh/config -- a ProxyJump through a corporate bastion,
+        # say -- wins over the vsock drop-in and sends this connection somewhere
+        # it cannot possibly work. That is a plausible configuration rather than
+        # an attack; no mode shares ~/.ssh with a session.
+        #
+        # Starting from no config means supplying the two options the drop-in
+        # would have: they are the only thing that teaches ssh what a vsock/<cid>
+        # host is, and without them it treats it as a hostname and tries DNS.
         "ssh", "-q", "-F", "/dev/null", "-i", str(key),
         "-o", f"ProxyCommand={SSH_PROXY} %h %p", "-o", "ProxyUseFdpass=yes",
         "-o", "CheckHostIP=no",
