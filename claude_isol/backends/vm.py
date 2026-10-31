@@ -27,26 +27,31 @@ root in the VM yet everything it writes to a share is owned by you on the host.
 from __future__ import annotations
 
 import os
-import random
+import secrets
+import shlex
 import shutil
 import signal
-import socket
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import click
 
-from ..claude_isol import (DEFAULT_IMAGE, HOME, confirm_cwd_submounts,
-                           ensure_image, resolve_prompt, set_parent_death_signal,
-                           stdin_from_text)
+from ..claude_isol import (CLAUDE_CONFIG_RO, DEFAULT_IMAGE, HOME,
+                           _prompt_index, confirm_cwd_submounts, ensure_image,
+                           set_parent_death_signal, stdin_from_text)
 from ..launch import Launch
 from ..vm import image as vm_image
 
 DEFAULT_MEMORY = "8G"
 GUEST_INIT = "/usr/local/bin/claude-isol-vm-init"
+CFG_GUEST_DIR = "/run/cfg"
+HANDSHAKE_GUEST_PATH = f"{CFG_GUEST_DIR}/handshake"
+# What virtiofsd needs in its own mount namespace, and nothing else: it serves
+# only --shared-dir, so anything not bound here is out of reach even if its path
+# resolution were tricked.
+VFSD_SYSTEM_DIRS = ("/usr", "/etc", "/opt")
 BOOT_TIMEOUT = 90.0        # generous: a cold page cache plus systemd
 SSH_RETRY_DELAY = 0.3
 
@@ -120,22 +125,13 @@ def _require(*binaries: str) -> None:
             "emulation is far too slow to be useful here")
 
 
-def _free_cid() -> int:
-    """A context id no live VM is using. 0-2 are reserved; a collision only shows
-    up when QEMU starts, so probe by binding the address ourselves first."""
-    for _ in range(64):
-        cid = random.randint(3, 0xFFFFFFF0)
-        try:
-            s = socket.socket(socket.AF_VSOCK, socket.SOCK_STREAM)
-        except (AttributeError, OSError):
-            return cid  # no AF_VSOCK on this host to probe with; let QEMU judge
-        with s:
-            try:
-                s.bind((cid, 22))
-            except OSError:
-                continue
-        return cid
-    raise click.UsageError("could not find a free vsock CID")
+def _pick_cid() -> int:
+    """A context id to ask QEMU for. There is no way to reserve one up front: a
+    host-side AF_VSOCK bind is only permitted for a *local* CID, so probing a
+    guest CID tells us nothing. QEMU is the authority -- it fails to start if the
+    cid is taken -- which is why _wait_for_guest() insists on proof that the VM
+    answering is ours before anything is sent to it."""
+    return 3 + secrets.randbelow(0xFFFFFF00)
 
 
 def _spawn(argv: list[str], ready: callable = None,
@@ -163,19 +159,51 @@ def _spawn(argv: list[str], ready: callable = None,
     return pid
 
 
-def _spawn_virtiofsd(tag: str, shared: Path, run_dir: Path) -> Path:
-    """One daemon per share. --translate-uid is what lets the guest run as root
-    while its writes land on the host as the launching user; --sandbox none keeps
-    the daemon unprivileged, which is all it needs for a directory we own."""
+def _spawn_virtiofsd(tag: str, shared: Path, run_dir: Path,
+                     read_only: tuple[str, ...] = ()) -> Path:
+    """One daemon per share, run inside a bubblewrap mount namespace.
+
+    Two things come from that namespace. It is where `read_only` is enforced:
+    the guest runs as root and can remount anything it likes, so a read-only
+    mount *inside* the VM would be advisory -- the only place a restriction
+    holds is on this side, where virtiofsd physically gets EROFS. And it is the
+    daemon's containment: only the system dirs it needs to run plus the share
+    itself are present, so a path-resolution slip has nothing else to reach.
+
+    --translate-uid is what lets the guest run as root while its writes land on
+    the host as the launching user. No --xattr: forwarding xattrs unmapped lets
+    guest root set POSIX ACLs on host files and hand them to another local user,
+    and nothing here needs them.
+    """
     sock = run_dir / f"vfs-{tag}.sock"
     sock.unlink(missing_ok=True)
-    _spawn([
+
+    inner = [
         shutil.which("virtiofsd") or "/usr/lib/virtiofsd",
         f"--socket-path={sock}", "--shared-dir", str(shared),
-        "--sandbox", "none", "--xattr", "--cache", "auto",
+        "--sandbox", "none", "--cache", "auto",
         f"--translate-uid=map:0:{os.getuid()}:1",
         f"--translate-gid=map:0:{os.getgid()}:1",
-    ], ready=sock.is_socket)
+    ]
+
+    wrap = ["bwrap", "--unshare-all", "--share-net", "--die-with-parent",
+            "--proc", "/proc", "--dev", "/dev"]
+    for d in VFSD_SYSTEM_DIRS:
+        if Path(d).is_dir():
+            wrap += ["--ro-bind", d, d]
+    for d in ("/bin", "/sbin", "/lib", "/lib64"):
+        pd = Path(d)
+        if pd.is_symlink():
+            wrap += ["--symlink", os.readlink(d), d]
+        elif pd.is_dir():
+            wrap += ["--ro-bind", d, d]
+    wrap += ["--bind", str(run_dir), str(run_dir)]      # for the socket
+    wrap += ["--bind", str(shared), str(shared)]
+    for name in read_only:                              # last-wins, so after
+        src = shared / name
+        if src.exists():
+            wrap += ["--ro-bind", str(src), str(src)]
+    _spawn([*wrap, "--", *inner], ready=sock.is_socket)
     return sock
 
 
@@ -250,13 +278,30 @@ def _qemu_argv(spec: Launch, disk: Path, kernel: Path, initrd: Path,
     return argv
 
 
-def _wait_for_ssh(key: Path, cid: int) -> None:
-    """Poll until the guest's vsock ssh socket answers, or give up."""
+def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
+    """Wait for the guest to answer, and prove it is the one we started.
+
+    The guest's identity is not checked by ssh here (a fresh VM has no known
+    host key), so instead the guest must read back a secret we placed in its
+    `cfg` share, which only our VM has. Without this, any local process able to
+    create a VM could squat the cid and receive the session -- the prompt, the
+    remote command line, and everything typed afterwards.
+
+    A dead QEMU is also an answer: if it could not take the cid, or failed for
+    any other reason, waiting the full timeout would hide the real error."""
     deadline = time.monotonic() + BOOT_TIMEOUT
-    probe = _ssh_argv(key, cid) + ["--", "true"]
+    probe = _ssh_argv(key, cid) + ["--", "cat", HANDSHAKE_GUEST_PATH]
     while time.monotonic() < deadline:
-        if subprocess.run(probe, capture_output=True).returncode == 0:
-            return
+        if os.waitpid(qemu_pid, os.WNOHANG)[0]:
+            raise click.UsageError(
+                f"qemu exited before the VM came up (cid {cid} already in use?)")
+        r = subprocess.run(probe, capture_output=True, text=True)
+        if r.returncode == 0:
+            if r.stdout.strip() == token:
+                return
+            raise click.UsageError(
+                f"the VM answering on vsock/{cid} is not the one we started; "
+                "refusing to hand it the session")
         time.sleep(SSH_RETRY_DELAY)
     raise click.UsageError(
         f"the VM did not answer on vsock/{cid} within {BOOT_TIMEOUT:g}s")
@@ -264,7 +309,10 @@ def _wait_for_ssh(key: Path, cid: int) -> None:
 
 def _ssh_argv(key: Path, cid: int) -> list[str]:
     return [
-        "ssh", "-q", "-i", str(key),
+        # -F /dev/null: the user's ssh_config must not be able to redirect this
+        # connection (a `Host *` ProxyCommand would), and nothing in it applies
+        # to a throwaway VM anyway.
+        "ssh", "-q", "-F", "/dev/null", "-i", str(key),
         # The "host" is a fresh VM every time, so a known_hosts entry would be
         # noise at best; the transport is a private vsock, not a network.
         "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
@@ -292,32 +340,59 @@ def launch(spec: Launch) -> None:
     run_id = f"{os.getpid()}-{random.randint(0, 0xFFFF):04x}"
     run_dir = _run_dir(run_id)
     _spawn_reaper(run_dir)
+    stage = _config_share(run_dir)
+    token = secrets.token_hex(16)
+    (stage / "handshake").write_text(token)
+
     prompt = None
     if spec.drop_shell:
         inner = ["bash", "-l"]
     elif spec.exec_cmd:
         inner = list(spec.args)
     else:
-        dst = (f"/run/cfg/prompt{spec.prompt_file.suffix}"
-               if spec.prompt_file else "")
-        args, prompt = resolve_prompt(spec, dst)
+        # The prompt never travels as an argument here. The remote command is a
+        # string the guest's shell re-parses, so a prompt containing `;` or
+        # `$(...)` would run as root in the guest before claude ever started --
+        # and an argument is world-readable in the host's ssh argv besides. Print
+        # mode gets it on stdin; anything else goes through the cfg share and is
+        # referenced as @path.
+        args = list(spec.args)
+        src = spec.prompt_file
+        if src is None:
+            idx = _prompt_index(args)
+            if idx is not None:
+                # An inline prompt: stage it so it travels by reference too.
+                src = stage / "prompt.md"
+                src.write_text(args[idx])
+                args = args[:idx] + args[idx + 1:]
+        if src is not None:
+            text = src.read_text()
+            if not text.strip():
+                raise click.UsageError(f"--prompt-file: {src} is empty")
+            if any(a in ("-p", "--print") for a in args) and sys.stdin.isatty():
+                prompt = text                      # print mode: stdin, verbatim
+            else:
+                name = f"prompt{src.suffix or '.md'}"
+                if src.parent != stage:
+                    shutil.copy(src, stage / name)
+                args.append(f"@{CFG_GUEST_DIR}/{name}")
         inner = ["claude", *args]
 
-    stage = _config_share(run_dir)
-    if spec.prompt_file is not None:
-        shutil.copy(spec.prompt_file, stage / f"prompt{spec.prompt_file.suffix}")
-
     socks = {
+        # ~/.claude has to be writable for transcripts and token refreshes, but
+        # the entries the host's own claude would later execute are pinned
+        # read-only here, where the guest cannot remount them (see finding 1).
+        "claude": _spawn_virtiofsd("claude", HOME / ".claude", run_dir,
+                                   read_only=CLAUDE_CONFIG_RO),
         "cwd": _spawn_virtiofsd("cwd", spec.cwd, run_dir),
-        "claude": _spawn_virtiofsd("claude", HOME / ".claude", run_dir),
         "cfg": _spawn_virtiofsd("cfg", stage, run_dir),
     }
 
     key, pubkey = _ssh_key(run_dir)
-    cid = _free_cid()
-    _spawn(_qemu_argv(spec, disk, kernel, initrd, cid, pubkey, socks),
-           env={"TMPDIR": str(vm_image.cache_dir())})
-    _wait_for_ssh(key, cid)
+    cid = _pick_cid()
+    qemu_pid = _spawn(_qemu_argv(spec, disk, kernel, initrd, cid, pubkey, socks),
+                      env={"TMPDIR": str(vm_image.cache_dir())})
+    _wait_for_guest(key, cid, token, qemu_pid)
 
     if prompt is not None:
         stdin_from_text(prompt)
@@ -327,4 +402,7 @@ def launch(spec: Launch) -> None:
     argv = _ssh_argv(key, cid)
     if not spec.drop_shell and sys.stdin.isatty() and prompt is None:
         argv.append("-t")
-    os.execvp("ssh", [*argv, "--", GUEST_INIT, *inner])
+    # ssh joins the remote command with spaces and the guest's shell splits it
+    # again, so every element is quoted for that shell.
+    remote = " ".join(shlex.quote(a) for a in (GUEST_INIT, *inner))
+    os.execvp("ssh", [*argv, "--", remote])
