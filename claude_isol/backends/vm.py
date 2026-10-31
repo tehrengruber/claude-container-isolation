@@ -58,6 +58,56 @@ def _runtime_dir() -> Path:
     return d
 
 
+def _run_dir(run_id: str) -> Path:
+    """Everything this run creates lives here: the ephemeral ssh key, the staged
+    credentials, the virtiofsd sockets. One directory means one thing to remove."""
+    d = _runtime_dir() / f"run-{run_id}"
+    d.mkdir(mode=0o700, exist_ok=True)
+    return d
+
+
+def _sweep_stale() -> None:
+    """Drop run directories whose session is gone -- a crash, a SIGKILL, or a
+    reboot that left the runtime dir behind. The run id starts with the launcher's
+    pid, so a live session is easy to tell from a dead one."""
+    for d in _runtime_dir().glob("run-*"):
+        pid = d.name.removeprefix("run-").split("-")[0]
+        if pid.isdigit() and Path(f"/proc/{pid}").exists():
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _spawn_reaper(run_dir: Path) -> int:
+    """Fork a child whose only job is to delete `run_dir` once we are gone.
+
+    The launcher exec's into ssh, so it cannot clean up after itself; and the run
+    directory holds a private key and copies of the gh credentials, which should
+    not outlive the session. PR_SET_PDEATHSIG turns our exit into a SIGTERM here,
+    and the handler removes the directory. A SIGKILL of the whole process group
+    would skip this, which is what _sweep_stale() covers on the next run."""
+    pid = os.fork()
+    if pid == 0:
+        try:
+            set_parent_death_signal(signal.SIGTERM)
+
+            def cleanup(*_):
+                shutil.rmtree(run_dir, ignore_errors=True)
+                os._exit(0)
+
+            for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                signal.signal(sig, cleanup)
+            # The parent may already have exited between fork and prctl, in which
+            # case no signal is coming and we clean up straight away.
+            if os.getppid() == 1:
+                cleanup()
+            while True:
+                signal.pause()
+        except BaseException:
+            shutil.rmtree(run_dir, ignore_errors=True)
+        os._exit(0)
+    return pid
+
+
 def _require(*binaries: str) -> None:
     missing = [b for b in binaries if shutil.which(b) is None]
     if missing:
@@ -88,12 +138,15 @@ def _free_cid() -> int:
     raise click.UsageError("could not find a free vsock CID")
 
 
-def _spawn(argv: list[str], ready: callable = None) -> int:
+def _spawn(argv: list[str], ready: callable = None,
+           env: dict[str, str] = None) -> int:
     """Fork a helper that dies with us, optionally waiting for it to be ready."""
     pid = os.fork()
     if pid == 0:
         try:
             set_parent_death_signal(signal.SIGTERM)
+            if env:
+                os.environ.update(env)
             os.execvp(argv[0], argv)
         except BaseException as e:  # noqa: BLE001
             os.write(2, f"{argv[0]} exec failed: {e!r}\n".encode())
@@ -110,11 +163,11 @@ def _spawn(argv: list[str], ready: callable = None) -> int:
     return pid
 
 
-def _spawn_virtiofsd(tag: str, shared: Path, run_id: str) -> Path:
+def _spawn_virtiofsd(tag: str, shared: Path, run_dir: Path) -> Path:
     """One daemon per share. --translate-uid is what lets the guest run as root
     while its writes land on the host as the launching user; --sandbox none keeps
     the daemon unprivileged, which is all it needs for a directory we own."""
-    sock = _runtime_dir() / f"vfs-{tag}-{run_id}.sock"
+    sock = run_dir / f"vfs-{tag}.sock"
     sock.unlink(missing_ok=True)
     _spawn([
         shutil.which("virtiofsd") or "/usr/lib/virtiofsd",
@@ -126,10 +179,10 @@ def _spawn_virtiofsd(tag: str, shared: Path, run_id: str) -> Path:
     return sock
 
 
-def _config_share(run_id: str) -> Path:
+def _config_share(run_dir: Path) -> Path:
     """A per-run directory holding what the guest needs bind-mounted onto single
     paths: virtiofs can share directories but not individual files."""
-    stage = _runtime_dir() / f"cfg-{run_id}"
+    stage = run_dir / "cfg"
     stage.mkdir(mode=0o700, exist_ok=True)
     gh = HOME / ".config" / "gh-claude"
     gh.mkdir(parents=True, exist_ok=True)
@@ -146,11 +199,11 @@ def _config_share(run_id: str) -> Path:
     return stage
 
 
-def _ssh_key(run_id: str) -> tuple[Path, str]:
+def _ssh_key(run_dir: Path) -> tuple[Path, str]:
     """An ephemeral keypair for this run. The public half travels on QEMU's
     command line, which every user on the machine can read -- fine for a public
     key, and the reason nothing secret goes through that channel."""
-    key = _runtime_dir() / f"vm-key-{run_id}"
+    key = run_dir / "vm-key"
     key.unlink(missing_ok=True)
     subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C",
                     "claude-isol", "-f", str(key)], check=True)
@@ -172,6 +225,15 @@ def _qemu_argv(spec: Launch, disk: Path, kernel: Path, initrd: Path,
         "-numa", "node,memdev=mem",
         "-kernel", str(kernel), "-initrd", str(initrd),
         "-append", "root=/dev/vda rw console=ttyS0 systemd.show_status=0 loglevel=3",
+        # -snapshot is what makes the guest disk ephemeral *and* safe to share:
+        # the cached image is opened read-only and every write goes to a temporary
+        # overlay, so concurrent VMs cannot corrupt each other (or the cache), and
+        # a dirty filesystem never survives into the next run. QEMU unlinks that
+        # overlay as soon as it creates it, so it disappears even on SIGKILL --
+        # which is why nothing here has to clean it up. TMPDIR points it at the
+        # image cache because the host's /tmp is often a tmpfs, and a build inside
+        # the VM would otherwise land in RAM.
+        "-snapshot",
         "-drive", f"file={disk},if=virtio,format=raw,cache=unsafe",
         "-device", f"vhost-vsock-pci,guest-cid={cid}",
         # User-mode networking: outbound works, nothing listens on the host, and
@@ -226,7 +288,10 @@ def launch(spec: Launch) -> None:
     disk = vm_image.disk_for(base)
     kernel, initrd = vm_image.boot_files(base)
 
+    _sweep_stale()
     run_id = f"{os.getpid()}-{random.randint(0, 0xFFFF):04x}"
+    run_dir = _run_dir(run_id)
+    _spawn_reaper(run_dir)
     prompt = None
     if spec.drop_shell:
         inner = ["bash", "-l"]
@@ -238,19 +303,20 @@ def launch(spec: Launch) -> None:
         args, prompt = resolve_prompt(spec, dst)
         inner = ["claude", *args]
 
-    stage = _config_share(run_id)
+    stage = _config_share(run_dir)
     if spec.prompt_file is not None:
         shutil.copy(spec.prompt_file, stage / f"prompt{spec.prompt_file.suffix}")
 
     socks = {
-        "cwd": _spawn_virtiofsd("cwd", spec.cwd, run_id),
-        "claude": _spawn_virtiofsd("claude", HOME / ".claude", run_id),
-        "cfg": _spawn_virtiofsd("cfg", stage, run_id),
+        "cwd": _spawn_virtiofsd("cwd", spec.cwd, run_dir),
+        "claude": _spawn_virtiofsd("claude", HOME / ".claude", run_dir),
+        "cfg": _spawn_virtiofsd("cfg", stage, run_dir),
     }
 
-    key, pubkey = _ssh_key(run_id)
+    key, pubkey = _ssh_key(run_dir)
     cid = _free_cid()
-    _spawn(_qemu_argv(spec, disk, kernel, initrd, cid, pubkey, socks))
+    _spawn(_qemu_argv(spec, disk, kernel, initrd, cid, pubkey, socks),
+           env={"TMPDIR": str(vm_image.cache_dir())})
     _wait_for_ssh(key, cid)
 
     if prompt is not None:

@@ -268,6 +268,20 @@ job. Nothing is configured in the guest for it — `systemd-ssh-generator` binds
 its public half delivered as a systemd credential over SMBIOS. Agent forwarding
 is explicitly off, so the VM never sees the host's keys.
 
+**Lifetime.** The session *is* the VM: `ssh` is exec'd in place, and QEMU plus
+the three virtiofsd are forked children holding `PR_SET_PDEATHSIG`, so when the
+ssh session ends they are torn down with it. The guest disk is opened with
+`-snapshot`, so every write goes to a temporary overlay QEMU unlinks the moment
+it creates it: the cached image is never written in place, concurrent VMs cannot
+corrupt each other, and a half-written filesystem never survives a kill. The
+per-run directory under `$XDG_RUNTIME_DIR/claude-isol` — holding the ephemeral
+ssh key and the staged credentials — is removed by a small reaper that wakes on
+our death; anything a SIGKILL leaves behind is swept on the next run.
+
+Teardown is a hard stop rather than an ACPI shutdown, which is deliberate: the
+only state that matters lives on the virtiofs shares, and those are write-through
+(no `--writeback`), so the host's files are already current.
+
 Not wired up in this mode: host notifications, `--host-exec`, the JetBrains MCP
 proxy and `--no-lan`.
 
