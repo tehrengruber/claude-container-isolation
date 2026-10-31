@@ -1,26 +1,39 @@
 #!/bin/bash
 # Guest-side setup for --vm, run by the ssh session before claude starts.
 #
-# Mounts the virtiofs shares and puts the single config files in place. Only
-# directories can be shared over virtiofs, so the scoped credentials arrive in
-# one `cfg` share and are bind-mounted onto their real paths here -- something
-# guest root can do freely, and the reason this runs in the guest rather than
-# being arranged on the host.
+# The cfg share is mounted read-only -- it lives on the host's $XDG_RUNTIME_DIR
+# tmpfs, and a guest that could write it could exhaust that tmpfs and take the
+# user's whole login session down with it. So the single config files are
+# *copied* out of it rather than bind-mounted from it: claude needs to write
+# ~/.claude.json, and gh rewrites its own config, and neither should be able to
+# write anything the host still holds.
+#
+# ~/.claude is a different matter: it is shared read-write because transcripts
+# and token refreshes belong on the host, with the entries the host's own claude
+# would later execute pinned read-only on that side (see CLAUDE_CONFIG_RO).
 set -u
 
 mountpoint -q /work || mount -t virtiofs cwd /work
-mountpoint -q /run/cfg || mount -t virtiofs cfg /run/cfg
+mountpoint -q /run/cfg || mount -t virtiofs -o ro cfg /run/cfg
 
 mkdir -p /root/.claude /root/.config/gh
 mountpoint -q /root/.claude || mount -t virtiofs claude /root/.claude
 
-bind_file() {  # bind_file <source in the cfg share> <target>
+copy_in() {  # copy_in <source in the cfg share> <target>
     [ -e "$1" ] || return 0
-    [ -e "$2" ] || : > "$2"
-    mountpoint -q "$2" || mount --bind "$1" "$2"
+    cp -f "$1" "$2" 2>/dev/null || return 0
+    chmod u+w "$2" 2>/dev/null || true
 }
-bind_file /run/cfg/claude.json /root/.claude.json
-bind_file /run/cfg/gitconfig /root/.gitconfig
-[ -d /run/cfg/gh ] && { mountpoint -q /root/.config/gh || mount --bind /run/cfg/gh /root/.config/gh; }
+copy_in /run/cfg/claude.json /root/.claude.json
+copy_in /run/cfg/gitconfig /root/.gitconfig
+if [ -d /run/cfg/gh ]; then
+    cp -rf /run/cfg/gh/. /root/.config/gh/ 2>/dev/null || true
+    chmod -R u+w /root/.config/gh 2>/dev/null || true
+fi
+
+# --no-lan pins a public resolver: the guest's queries are re-originated by passt
+# on the host, where the egress filter drops anything bound for a private
+# address -- which the host's own resolvers usually are.
+copy_in /run/cfg/resolv.conf /etc/resolv.conf
 
 exec "$@"

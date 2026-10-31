@@ -50,7 +50,8 @@ container, with an MCP-filtering proxy in front of the JetBrains IDE link.
 - `podman` (with `pasta` networking)
 - Python 3.11+ with `websockets` and `click`
 - `bubblewrap` (only for `--local` mode)
-- `qemu-base`, `virtiofsd`, `openssh` and access to `/dev/kvm` (only for `--vm`)
+- `qemu-base`, `virtiofsd`, `openssh`, `passt`, `bubblewrap` and access to
+  `/dev/kvm` (only for `--vm`)
 
 ## Installing
 
@@ -268,6 +269,15 @@ job. Nothing is configured in the guest for it — `systemd-ssh-generator` binds
 its public half delivered as a systemd credential over SMBIOS. Agent forwarding
 is explicitly off, so the VM never sees the host's keys.
 
+**Networking.** The guest reaches the internet through `passt`, the same way the
+container does — and with `--no-map-gw`, so it is *not* offered a route to the
+host's own services the way QEMU's built-in user networking would be. `--no-lan`
+works here too, and for the same reason it works for the container: passt
+re-originates the guest's packets from this process tree, so running it under the
+filtered cgroup puts every connection the guest makes behind the eBPF egress
+filter. The guest's resolver is pinned to a public address when that is on, since
+the host's own resolvers are usually in the private ranges the filter drops.
+
 **Lifetime.** The session *is* the VM: `ssh` is exec'd in place, and QEMU plus
 the three virtiofsd are forked children holding `PR_SET_PDEATHSIG`, so when the
 ssh session ends they are torn down with it. The guest disk is opened with
@@ -282,8 +292,8 @@ Teardown is a hard stop rather than an ACPI shutdown, which is deliberate: the
 only state that matters lives on the virtiofs shares, and those are write-through
 (no `--writeback`), so the host's files are already current.
 
-Not wired up in this mode: host notifications, `--host-exec`, the JetBrains MCP
-proxy and `--no-lan`.
+Not wired up in this mode: host notifications, `--host-exec` and the JetBrains
+MCP proxy.
 
 ## Local sandbox mode (`--local`)
 

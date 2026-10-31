@@ -38,9 +38,10 @@ from pathlib import Path
 
 import click
 
-from ..claude_isol import (CLAUDE_CONFIG_RO, DEFAULT_IMAGE, HOME,
+from ..claude_isol import (CLAUDE_CONFIG_RO, DEFAULT_IMAGE, HOME, PUBLIC_DNS,
                            _prompt_index, confirm_cwd_submounts, ensure_image,
-                           set_parent_death_signal, stdin_from_text)
+                           set_parent_death_signal, setup_nolan_cgroup,
+                           stdin_from_text)
 from ..launch import Launch
 from ..vm import image as vm_image
 
@@ -113,6 +114,28 @@ def _spawn_reaper(run_dir: Path) -> int:
     return pid
 
 
+def _stage_resolv(stage: Path) -> None:
+    """Pin the guest's resolver for --no-lan, for the same reason the other two
+    modes do: the host's own resolvers are usually on the LAN, and the egress
+    filter drops traffic there. Written with the rest of the staging, before the
+    share is served; the guest picks it up in vm_init.sh."""
+    (stage / "resolv.conf").write_text(
+        "".join(f"nameserver {ns}\n" for ns in PUBLIC_DNS))
+
+
+def _enter_nolan_cgroup() -> None:
+    """Join the filtered cgroup, which anything forked after this inherits.
+
+    Nothing new is needed for --no-lan here: passt re-originates the guest's
+    packets from host sockets, exactly as pasta does for the container, so passt
+    and QEMU running under the filter puts every connection the guest makes
+    under it too. Unlike podman -- which asks the user systemd manager for a
+    fresh scope, and had to be pinned to the cgroupfs manager to stop it
+    escaping -- a plain fork simply stays in our cgroup."""
+    run_cg = setup_nolan_cgroup()
+    (run_cg / "cgroup.procs").write_text(str(os.getpid()))
+
+
 def _require(*binaries: str) -> None:
     missing = [b for b in binaries if shutil.which(b) is None]
     if missing:
@@ -160,7 +183,8 @@ def _spawn(argv: list[str], ready: callable = None,
 
 
 def _spawn_virtiofsd(tag: str, shared: Path, run_dir: Path,
-                     read_only: tuple[str, ...] = ()) -> Path:
+                     read_only: tuple[str, ...] = (),
+                     writable: bool = True) -> Path:
     """One daemon per share, run inside a bubblewrap mount namespace.
 
     Two things come from that namespace. It is where `read_only` is enforced:
@@ -198,7 +222,7 @@ def _spawn_virtiofsd(tag: str, shared: Path, run_dir: Path,
         elif pd.is_dir():
             wrap += ["--ro-bind", d, d]
     wrap += ["--bind", str(run_dir), str(run_dir)]      # for the socket
-    wrap += ["--bind", str(shared), str(shared)]
+    wrap += ["--ro-bind" if not writable else "--bind", str(shared), str(shared)]
     for name in read_only:                              # last-wins, so after
         src = shared / name
         if src.exists():
@@ -240,8 +264,21 @@ def _ssh_key(run_dir: Path) -> tuple[Path, str]:
     return key, Path(f"{key}.pub").read_text().strip()
 
 
+def _spawn_passt(run_dir: Path) -> Path:
+    """The guest's way out. passt runs unprivileged, re-originates the guest's
+    packets from this process tree -- which is what puts them under the --no-lan
+    cgroup filter -- and with --no-map-gw does not offer itself as a route to
+    the host's own services."""
+    sock = run_dir / "net.sock"
+    sock.unlink(missing_ok=True)
+    _spawn(["passt", "--foreground", "--no-map-gw", "--no-ndp", "--no-dhcpv6",
+            "--socket", str(sock)], ready=sock.exists)
+    return sock
+
+
 def _qemu_argv(spec: Launch, disk: Path, kernel: Path, initrd: Path,
-               cid: int, pubkey: str, socks: dict[str, Path]) -> list[str]:
+               cid: int, pubkey: str, socks: dict[str, Path],
+               net_sock: Path) -> list[str]:
     mem = spec.vm_memory or DEFAULT_MEMORY
     cpus = spec.vm_cpus or max(2, (os.cpu_count() or 2) // 2)
     argv = [
@@ -264,9 +301,15 @@ def _qemu_argv(spec: Launch, disk: Path, kernel: Path, initrd: Path,
         "-snapshot",
         "-drive", f"file={disk},if=virtio,format=raw,cache=unsafe",
         "-device", f"vhost-vsock-pci,guest-cid={cid}",
-        # User-mode networking: outbound works, nothing listens on the host, and
-        # no privileged setup is needed.
-        "-netdev", "user,id=net0", "-device", "virtio-net-pci,netdev=net0",
+        # passt, not slirp: slirp maps the host at 10.0.2.2 and completes guest
+        # connections against the host's own loopback, so every service bound to
+        # 127.0.0.1 that trusts localhost would be reachable from the VM --
+        # looser than container mode, where that is what --tcp-forward is for.
+        # passt --no-map-gw declines to be that bridge. It is also the process
+        # that re-originates the guest's packets, which is what lets --no-lan
+        # work here at all (see below).
+        "-netdev", f"stream,id=net0,addr.type=unix,addr.path={net_sock}",
+        "-device", "virtio-net-pci,netdev=net0",
         # The guest's ssh key, delivered as a systemd credential.
         "-smbios",
         f"type=11,value=io.systemd.credential:ssh.ephemeral-authorized_keys-all={pubkey}",
@@ -292,7 +335,11 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
     deadline = time.monotonic() + BOOT_TIMEOUT
     probe = _ssh_argv(key, cid) + ["--", "cat", HANDSHAKE_GUEST_PATH]
     while time.monotonic() < deadline:
-        if os.waitpid(qemu_pid, os.WNOHANG)[0]:
+        try:
+            gone = bool(os.waitpid(qemu_pid, os.WNOHANG)[0])
+        except ChildProcessError:
+            gone = True          # already reaped; either way it is not running
+        if gone:
             raise click.UsageError(
                 f"qemu exited before the VM came up (cid {cid} already in use?)")
         r = subprocess.run(probe, capture_output=True, text=True)
@@ -324,7 +371,7 @@ def _ssh_argv(key: Path, cid: int) -> list[str]:
 
 
 def launch(spec: Launch) -> None:
-    _require("qemu-system-x86_64", "ssh", "ssh-keygen")
+    _require("qemu-system-x86_64", "ssh", "ssh-keygen", "passt", "bwrap")
     if shutil.which("virtiofsd") is None and not Path("/usr/lib/virtiofsd").exists():
         raise click.UsageError("--vm needs virtiofsd (pacman -S virtiofsd)")
 
@@ -337,12 +384,14 @@ def launch(spec: Launch) -> None:
     kernel, initrd = vm_image.boot_files(base)
 
     _sweep_stale()
-    run_id = f"{os.getpid()}-{random.randint(0, 0xFFFF):04x}"
+    run_id = f"{os.getpid()}-{secrets.token_hex(3)}"
     run_dir = _run_dir(run_id)
     _spawn_reaper(run_dir)
     stage = _config_share(run_dir)
     token = secrets.token_hex(16)
     (stage / "handshake").write_text(token)
+    if spec.no_lan:
+        _stage_resolv(stage)
 
     prompt = None
     if spec.drop_shell:
@@ -385,12 +434,23 @@ def launch(spec: Launch) -> None:
         "claude": _spawn_virtiofsd("claude", HOME / ".claude", run_dir,
                                    read_only=CLAUDE_CONFIG_RO),
         "cwd": _spawn_virtiofsd("cwd", spec.cwd, run_dir),
-        "cfg": _spawn_virtiofsd("cfg", stage, run_dir),
+        # Read-only, and not because the guest has no business writing it: the
+        # staging dir sits on the host's XDG_RUNTIME_DIR tmpfs, so a guest that
+        # could write it could fill that tmpfs and take down the user's login
+        # session. The guest copies what it needs out instead (vm_init.sh).
+        "cfg": _spawn_virtiofsd("cfg", stage, run_dir, writable=False),
     }
 
     key, pubkey = _ssh_key(run_dir)
     cid = _pick_cid()
-    qemu_pid = _spawn(_qemu_argv(spec, disk, kernel, initrd, cid, pubkey, socks),
+
+    # Before passt and QEMU are forked, so both inherit the filtered cgroup.
+    if spec.no_lan:
+        _enter_nolan_cgroup()
+    net_sock = _spawn_passt(run_dir)
+
+    qemu_pid = _spawn(_qemu_argv(spec, disk, kernel, initrd, cid, pubkey, socks,
+                                 net_sock),
                       env={"TMPDIR": str(vm_image.cache_dir())})
     _wait_for_guest(key, cid, token, qemu_pid)
 
