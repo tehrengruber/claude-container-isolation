@@ -46,6 +46,19 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, **kw)
 
 
+def _discard(work: Path) -> None:
+    """Remove a build tree, from inside the user namespace that made it.
+
+    The extracted rootfs belongs to subuids, so from out here even its owner
+    cannot unlink it -- shutil.rmtree gets EPERM, and with ignore_errors=True it
+    failed silently and left gigabytes in the cache after every build."""
+    if not work.exists():
+        return
+    subprocess.run(["podman", "unshare", "rm", "-rf", str(work)],
+                   capture_output=True)
+    shutil.rmtree(work, ignore_errors=True)
+
+
 def guest_digest(base_image: str) -> str:
     """Build the guest image if needed and return the digest of what will boot.
 
@@ -69,7 +82,7 @@ def disk_for(digest: str) -> Path:
           file=sys.stderr)
 
     work = cache_dir() / f".build-{digest[:16]}"
-    shutil.rmtree(work, ignore_errors=True)
+    _discard(work)
     work.mkdir()
     tmp_disk = disk.with_name(disk.name + ".partial")
     try:
@@ -86,13 +99,19 @@ def disk_for(digest: str) -> Path:
         root = work / "root"
         root.mkdir()
         # A user namespace so the extracted tree may own root-owned files, and
-        # mkfs.ext4 -d so no loop mount (and so no real root) is needed.
+        # mkfs.ext4 -d so no loop mount (and so no real root) is needed. The tree
+        # is also discarded in here, where unlinking subuid-owned files is
+        # permitted. Paths go in as positional arguments rather than interpolated
+        # into the script, so a quote or a $ in a cache path cannot break it.
         _run(["podman", "unshare", "--", "sh", "-euc",
-              f'tar -xpf "{tar}" -C "{root}" && '
-              f'mkfs.ext4 -q -F -L claude-isol -d "{root}" "{tmp_disk}" "{DISK_SIZE}"'])
+              'tar -xpf "$1" -C "$2" && '
+              'mkfs.ext4 -q -F -L claude-isol -d "$2" "$3" "$4" && '
+              'rm -rf "$2"',
+              "claude-isol-vm-build", str(tar), str(root), str(tmp_disk),
+              DISK_SIZE])
         tmp_disk.replace(disk)
     finally:
-        shutil.rmtree(work, ignore_errors=True)
+        _discard(work)
         tmp_disk.unlink(missing_ok=True)
     return disk
 
