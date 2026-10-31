@@ -26,6 +26,9 @@ from typing import Optional
 
 import click
 
+from . import backends
+from .launch import Launch
+
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGE = os.environ.get("CLAUDE_ISO_IMAGE", "claude-isolation:latest")
 HOME = Path(os.environ["HOME"])
@@ -138,6 +141,19 @@ def prompt_off_argv(args: list[str]) -> tuple[list[str], Optional[str]]:
     if idx is None:
         return args, None
     return args[:idx] + args[idx + 1:], args[idx]
+
+
+def resolve_prompt(spec, dst: str) -> tuple[list[str], Optional[str]]:
+    """The prompt plumbing every backend shares: returns (claude args, text to
+    feed on stdin). `dst` is where a --prompt-file will be readable from inside
+    that backend's sandbox, which is the only part that differs between modes; a
+    mount spec for it is appended to spec.volumes."""
+    if spec.prompt_file is not None:
+        args, prompt, mount = prompt_from_file(spec.prompt_file, spec.args, dst)
+        if mount is not None:
+            spec.volumes.append(mount)
+        return args, prompt
+    return prompt_off_argv(spec.args)
 
 
 def stdin_from_text(text: str) -> None:
@@ -769,6 +785,15 @@ def _validate_dev_bind(ctx, param, value):
               help="Omit --userns entirely (use podman's default; HOME becomes /root).")
 @click.option("--local", is_flag=True,
               help="Run on the host under a bubblewrap sandbox (no container).")
+@click.option("--vm", is_flag=True,
+              help="Run in a QEMU virtual machine, where claude is root in its own "
+                   "kernel and can do anything (nested containers included) while "
+                   "the host stays behind the VM boundary. Needs /dev/kvm; the "
+                   "working directory is shared in over virtiofs.")
+@click.option("--vm-memory", metavar="SIZE",
+              help="RAM for --vm (QEMU syntax, e.g. 8G). Default 8G.")
+@click.option("--vm-cpus", metavar="N", type=int,
+              help="vCPUs for --vm. Default: half the host's, at least 2.")
 @click.option("--tmpfs-home", is_flag=True,
               help="Mount HOME as a fresh tmpfs. Under --local HOME is always a fresh "
                    "tmpfs; there this flag leaves it writable instead of read-only.")
@@ -823,10 +848,10 @@ def _validate_dev_bind(ctx, param, value):
                    "/dev/bus/usb, ...), which a plain -v bind blocks; repeatable. "
                    "--local only.")
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
-def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
-         mount_cwd_recursively, no_lan, exec_cmd, env_vars, tcp_forwards,
-         host_exec, prompt_file, home_subdirs, podman_args, volumes, dev_binds,
-         claude_args):
+def main(drop_shell, image, install_claude, no_userns, local, vm, vm_memory,
+         vm_cpus, tmpfs_home, mount_cwd_recursively, no_lan, exec_cmd, env_vars,
+         tcp_forwards, host_exec, prompt_file, home_subdirs, podman_args, volumes,
+         dev_binds, claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -855,213 +880,41 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         # The tool is exposed to a claude session; there is none to expose it to.
         raise click.UsageError("--host-exec cannot be combined with --shell/--exec")
 
-    if local and (image or install_claude or no_userns):
-        raise click.UsageError(
-            "--local cannot be combined with --image/--install-claude/--no-userns")
-    if dev_binds and not local:
-        raise click.UsageError("--dev-bind only applies to --local mode")
-    if host_exec and local:
-        raise click.UsageError("--host-exec only applies to container mode")
-    if podman_args and local:
-        raise click.UsageError("--podman-arg only applies to container mode "
-                               "(--local runs bwrap, not podman)")
+    if local and vm:
+        raise click.UsageError("--local and --vm are different modes; pick one")
+
+    spec = Launch(
+        mode="local" if local else "vm" if vm else "container",
+        cwd=Path.cwd(),
+        args=args,
+        drop_shell=drop_shell,
+        exec_cmd=exec_cmd,
+        prompt_file=prompt_file,
+        volumes=volumes,
+        env_vars=env_vars,
+        home_subdirs=home_subdirs,
+        no_lan=no_lan,
+        mount_cwd_recursively=mount_cwd_recursively,
+        image=image,
+        install_claude=install_claude,
+        no_userns=no_userns,
+        tmpfs_home=tmpfs_home,
+        tcp_forwards=tcp_forwards,
+        host_exec=host_exec,
+        podman_args=podman_args,
+        dev_binds=dev_binds,
+        vm_memory=vm_memory,
+        vm_cpus=vm_cpus,
+    )
+    spec.check_mode_flags()
 
     # --no-lan creates a per-run cgroup; if our terminal's cgroup isn't delegated
     # (PyCharm/SSH/TTY), re-exec into a delegated scope first. No-op otherwise.
     if no_lan:
         reexec_in_delegated_scope()
 
-    if local:
-        if shutil.which("bwrap") is None:
-            click.echo("--local requires bubblewrap (bwrap); install the "
-                       "'bubblewrap' package", err=True)
-            raise SystemExit(2)
-        cwd = Path.cwd()
-        confirm_cwd_submounts(cwd, mount_cwd_recursively)
-        # Scoped gh/git credentials, created on first run (shared with container mode).
-        (HOME / ".config" / "gh-claude").mkdir(parents=True, exist_ok=True)
-        (HOME / ".gitconfig-claude").touch(exist_ok=True)
-        prompt = None
-        if drop_shell:
-            inner = [os.environ.get("SHELL", "bash")]
-        elif exec_cmd:
-            inner = args
-        else:
-            if prompt_file is not None:
-                # The sandbox keeps host paths, so the file is referenced where it
-                # already lives; the bind rides in with the user -v specs, which are
-                # emitted after the tmpfs HOME and so survive a prompt file under it.
-                src = str(prompt_file.resolve())
-                args, prompt, mount = prompt_from_file(prompt_file, args, src)
-                if mount is not None:
-                    volumes.append(mount)
-            else:
-                args, prompt = prompt_off_argv(args)
-            inner = ["claude", *args]
-        resolv = None
-        if no_lan:
-            run_cg = setup_nolan_cgroup()
-            resolv = public_resolv()
-            # Move ourselves into the filtered cgroup; the exec'd bwrap (and its
-            # whole tree) inherit the membership and thus the egress filter.
-            (run_cg / "cgroup.procs").write_text(str(os.getpid()))
-        if prompt is not None:
-            stdin_from_text(prompt)
-        os.execvp("bwrap", build_bwrap_cmd(cwd, volumes, inner, resolv, dev_binds,
-                                           home_subdirs, tmpfs_home))
-        return  # unreachable
-
-    if image is None:
-        # No image specified: use the bundled default, building it on demand.
-        image = DEFAULT_IMAGE
-        ensure_image(image)
-    elif install_claude:
-        image = install_claude_on_top(image)
-
-    cwd = Path.cwd()
-    confirm_cwd_submounts(cwd, mount_cwd_recursively)
-    prompt = None
-    if not drop_shell and not exec_cmd:
-        if prompt_file is not None:
-            dst = f"/run/claude-isol-prompt{prompt_file.suffix}"
-            args, prompt, mount = prompt_from_file(prompt_file, args, dst)
-            if mount is not None:
-                volumes.append(mount)
-        else:
-            args, prompt = prompt_off_argv(args)
-    ide_lock = None if (drop_shell or exec_cmd) else find_ide_lock(cwd)
-
-    # Without --userns=keep-id, container uid 0 maps to the host user, so HOME
-    # inside the container is /root rather than the host home path.
-    container_home = Path("/root") if no_userns else HOME
-
-    pasta_opts: list[str] = []
-    extra_mounts: list[str] = []
-    ide_env: list[str] = []
-
-    if ide_lock is not None:
-        proxy_port = spawn_proxy(ide_lock.stem)
-        tmp_ide = Path(tempfile.mkdtemp(prefix="claude-ide-"))
-        shutil.copy(ide_lock, tmp_ide / f"{proxy_port}.lock")
-        pasta_opts.append(f"-T,{proxy_port}")
-        extra_mounts = ["-v", f"{tmp_ide}:{container_home}/.claude/ide"]
-        # Name the port out of band. Left to discover the IDE on its own, claude
-        # vets a lock file by signal-probing the pid recorded in it and walking the
-        # process tree looking for that pid -- both of which are answers only the
-        # host's pid namespace can give. Announcing the port instead satisfies the
-        # lookup directly, so the container keeps its own pid namespace.
-        ide_env = ["-e", f"CLAUDE_CODE_SSE_PORT={proxy_port}"]
-
-    pasta_opts.extend(f"-T,{port}" for port in tcp_forwards)
-    network = "pasta" + (":" + ",".join(pasta_opts) if pasta_opts else "")
-
-    gh_config = HOME / ".config" / "gh-claude"
-    gh_config.mkdir(parents=True, exist_ok=True)
-
-    gitconfig = HOME / ".gitconfig-claude"
-    gitconfig.touch(exist_ok=True)
-
-    notify_mounts: list[str] = []
-    notify_env: list[str] = []
-    notify_args: list[str] = []
-    if not drop_shell and not exec_cmd:
-        notify_mounts, notify_env, notify_args = notify_wiring()
-
-    hostexec_mounts: list[str] = []
-    hostexec_env: list[str] = []
-    hostexec_args: list[str] = []
-    if host_exec:
-        hostexec_mounts, hostexec_env, hostexec_args = hostexec_wiring(cwd)
-
-    # No pty when the prompt is arriving on stdin: -t would put one between the
-    # pipe and claude, and claude reads a tty as an interactive session.
-    tty_flag = (["-t"] if prompt is None and sys.stdin.isatty() and sys.stdout.isatty()
-                else [])
-    userns_flag = [] if no_userns else ["--userns=keep-id"]
-    # A tmpfs HOME wipes whatever the image ships under the home dir; the config
-    # bind mounts below are layered on top (podman orders mounts parent-first).
-    tmpfs_flag = ["--tmpfs", str(container_home)] if tmpfs_home else []
-
-    # Writable scratch inside an otherwise untouched HOME. Without this, HOME in the
-    # container is the image's root-owned directory with only the config paths bound
-    # over it, so a tool that wants ~/.cache or ~/.npm cannot even create it. podman
-    # orders mounts parent-first, so these land on top of a tmpfs HOME as well.
-    # mode=1777 because the tmpfs is created root-owned and the session runs as the
-    # mapped user; exec so it matches /tmp (podman's tmpfs default is noexec).
-    home_subdir_flags = [
-        arg for rel in home_subdirs
-        for arg in ("--tmpfs", f"{container_home / rel}:rw,exec,mode=1777")
-    ]
-
-    # --no-lan: run the whole podman process tree under a cgroup that carries the
-    # egress filter, and pin DNS to the public resolver.
-    #
-    # Two things matter here. (1) We must use the cgroupfs manager: with the
-    # default systemd manager, rootless podman asks the user systemd manager for a
-    # fresh podman-<pid>.scope and moves itself there, escaping our cgroup. (2) We
-    # do NOT pass our cgroup's full root-relative path as --cgroup-parent -- rootless
-    # podman+cgroupfs interprets --cgroup-parent relative to its *current* cgroup, so
-    # the full path gets appended to wherever podman already is, creating a doubled,
-    # unfiltered cgroup elsewhere. Instead we move ourselves into the filtered cgroup
-    # just before exec (see below); podman then stays put (cgroupfs manager) and
-    # creates conmon, pasta and the container as descendants -- all inheriting the
-    # filter. pasta is the process that re-originates the container's packets, so it
-    # too must live under the filtered cgroup, which this guarantees.
-    nolan_flags: list[str] = []
-    nolan_cg: Optional[Path] = None
-    if no_lan:
-        nolan_cg = setup_nolan_cgroup()
-        nolan_flags = [
-            "--cgroup-manager=cgroupfs",
-            "--cgroup-parent=ctr",
-            *[a for ns in PUBLIC_DNS for a in ("--dns", ns)],
-        ]
-
-    cmd = [
-        "podman", "run", "--rm", "-i", *tty_flag,
-        f"--network={network}",
-        *nolan_flags,
-        *userns_flag,
-        *tmpfs_flag,
-        *home_subdir_flags,
-        "-v", f"{HOME}/.claude:{container_home}/.claude",
-        *extra_mounts,
-        "-v", f"{HOME}/.claude.json:{container_home}/.claude.json",
-        "-v", f"{gh_config}:{container_home}/.config/gh",
-        "-v", f"{gitconfig}:{container_home}/.gitconfig",
-        "-v", f"{cwd}:{cwd}",
-        *[arg for spec in volumes for arg in ("-v", spec)],
-        *notify_mounts,
-        *hostexec_mounts,
-        "-w", str(cwd),
-        "-e", f"HOME={container_home}",
-        "-e", "TERM",
-        *ide_env,
-        *[arg for var in env_vars for arg in ("-e", var)],
-        *notify_env,
-        *hostexec_env,
-        # Last of the options, just before the image, so a --podman-arg can override
-        # anything set above it -- and so a stray one lands as a podman flag rather
-        # than as an argument to claude.
-        *podman_args,
-        image,
-        *(["bash"] if drop_shell else
-          list(args) if exec_cmd else
-          ["claude", *notify_args, *hostexec_args, *args]),
-    ]
-
-    # Move ourselves into the filtered cgroup last, just before exec: with the
-    # cgroupfs manager podman stays in this cgroup and spawns conmon/pasta/the
-    # container beneath it, so the egress filter is inherited by the lot.
-    if nolan_cg is not None:
-        (nolan_cg / "cgroup.procs").write_text(str(os.getpid()))
-
-    if prompt is not None:
-        stdin_from_text(prompt)
-
-    os.execvp("podman", cmd)
-    return  # unreachable
-
+    backends.launch(spec)
+    return  # unreachable: the backend exec's
 
 if __name__ == "__main__":
     main()
