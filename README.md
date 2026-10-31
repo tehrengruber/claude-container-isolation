@@ -240,8 +240,14 @@ claude-isol --vm                       # 8G, half the host's cores
 claude-isol --vm --vm-memory 16G --vm-cpus 8
 ```
 
-Requires `/dev/kvm` (join the `kvm` group), plus `qemu-base`, `virtiofsd` and
-`openssh`. The first run builds a bootable disk from the container image and
+Requires `/dev/kvm` (join the `kvm` group), plus `qemu-base`, `virtiofsd`,
+`passt`, `bubblewrap` and `openssh`.
+
+Hardware virtualization is passed through when the host allows nesting
+(`/sys/module/kvm_amd/parameters/nested`, or `kvm_intel` on Intel), so the
+session can run VMs of its own — `claude-isol --vm` included. The guest image
+ships no qemu, so install what you want to run in there, or add it to
+`Dockerfile.vm`. The first run builds a bootable disk from the container image and
 caches it under `~/.cache/claude-isol/vm`, keyed by that image's digest, so it is
 rebuilt only when the image changes.
 

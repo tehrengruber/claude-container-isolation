@@ -376,13 +376,42 @@ def _spawn_passt(run_dir: Path) -> Path:
     return sock
 
 
+def _cpu_model() -> str:
+    """`-cpu host`, plus the hardware virtualization feature when the host
+    permits nesting.
+
+    Being root in its own kernel is not much use if the one thing the session
+    cannot do is start a VM, which is what claude-isol itself does. The feature
+    is only requested when the host's kvm module says nesting is on: asking for
+    svm or vmx that the host will not provide makes qemu complain about a feature
+    it cannot honour, and this way an unprepared host simply gets no nesting
+    rather than a warning on every launch.
+    """
+    model = "host"
+    try:
+        info = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        return model
+    for vendor, mod, feature in (("AuthenticAMD", "kvm_amd", "svm"),
+                                 ("GenuineIntel", "kvm_intel", "vmx")):
+        if vendor not in info:
+            continue
+        nested = Path(f"/sys/module/{mod}/parameters/nested")
+        try:
+            if nested.read_text().strip() in ("1", "Y", "y"):
+                model += f",+{feature}"
+        except OSError:
+            pass
+    return model
+
+
 def _qemu_argv(spec: Launch, disk: Path, kernel: Path, initrd: Path,
                cid: int, pubkey: str, socks: dict[str, Path],
                net_sock: Path) -> list[str]:
     mem = spec.vm_memory or DEFAULT_MEMORY
     cpus = spec.vm_cpus or max(2, (os.cpu_count() or 2) // 2)
     argv = [
-        "qemu-system-x86_64", "-enable-kvm", "-cpu", "host",
+        "qemu-system-x86_64", "-enable-kvm", "-cpu", _cpu_model(),
         "-machine", "q35", "-smp", str(cpus), "-m", mem,
         "-nographic", "-no-reboot",
         # virtiofs needs the guest's RAM to be shareable with the daemons.
