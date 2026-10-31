@@ -505,6 +505,10 @@ def _ssh_argv(key: Path, cid: int) -> list[str]:
         "ssh", "-q", "-F", "/dev/null", "-i", str(key),
         "-o", f"ProxyCommand={SSH_PROXY} %h %p", "-o", "ProxyUseFdpass=yes",
         "-o", "CheckHostIP=no",
+        # A vsock connect to a guest whose transport is not attached does not get
+        # refused, it just sits there -- so bound it, or every probe during boot
+        # costs the full probe timeout and says nothing useful.
+        "-o", "ConnectTimeout=5",
         # The "host" is a fresh VM every time, so a known_hosts entry would be
         # noise at best; the transport is a private vsock, not a network.
         "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",

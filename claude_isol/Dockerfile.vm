@@ -45,9 +45,15 @@ RUN systemctl enable systemd-networkd systemd-resolved \
 # instantiates openssh's own sshd@.service per connection, so sshd still needs
 # no configuration and still picks up the authorized key from the credential the
 # host passes over SMBIOS.
+#
+# The vsock transport is loaded explicitly for the same timing reason: without
+# it the guest has no AF_VSOCK until udev gets round to the virtio device, and a
+# host-side connect to a guest that is not listening yet does not get refused --
+# it blocks, which is what the launcher was seeing on every probe.
 RUN printf '[Unit]\nDescription=OpenSSH on AF_VSOCK\n\n[Socket]\nListenStream=vsock::22\nAccept=yes\n\n[Install]\nWantedBy=sockets.target\n' \
         > /etc/systemd/system/sshd.socket \
- && systemctl enable sshd.socket
+ && systemctl enable sshd.socket \
+ && echo vmw_vsock_virtio_transport > /etc/modules-load.d/claude-isol-vsock.conf
 
 # The guest side of the virtiofs shares. /work is the cwd; the config share is
 # mounted and its single files bind-mounted into place by claude-isol-vm-init,
