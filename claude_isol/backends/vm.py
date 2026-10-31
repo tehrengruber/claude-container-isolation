@@ -87,6 +87,18 @@ VFSD_SYSTEM_DIRS = ("/usr", "/etc", "/opt")
 BOOT_TIMEOUT = 90.0        # generous: a cold page cache plus systemd
 SSH_RETRY_DELAY = 0.3
 PROBE_TIMEOUT = 10.0       # one connection attempt, so the loop keeps progressing
+SSH_FAILED = 255           # ssh's own exit status: it never reached the guest
+
+
+def _console_hint() -> str:
+    return f"guest console: {vm_image.cache_dir() / 'last-console.log'}"
+
+
+def _remote_command(*argv: str) -> str:
+    """One string for ssh to hand the guest's shell, quoted for it. ssh joins a
+    remote command with spaces and the far shell splits it again, so quoting
+    here is what keeps a prompt or a path with a space in one piece."""
+    return " ".join(shlex.quote(a) for a in argv)
 
 
 def _run_dir(run_id: str) -> Path:
@@ -422,10 +434,17 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
     create a VM could squat the cid and receive the session -- the prompt, the
     remote command line, and everything typed afterwards.
 
-    A dead QEMU is also an answer: if it could not take the cid, or failed for
-    any other reason, waiting the full timeout would hide the real error."""
+    Only one thing is worth waiting for: a guest that has not finished booting,
+    which shows up as ssh failing to connect at all (exit 255, connection
+    refused or reset). Everything else is decided -- qemu gone, our key refused,
+    the guest answering but unable to produce the token -- and is reported the
+    moment it happens rather than after the full timeout.
+
+    The probe runs the guest init, not a bare `cat`: the token lives in the cfg
+    share, and nothing has mounted that until the init does."""
     deadline = time.monotonic() + BOOT_TIMEOUT
-    probe = _ssh_argv(key, cid) + ["--", "cat", HANDSHAKE_GUEST_PATH]
+    probe = _ssh_argv(key, cid) + [
+        "--", _remote_command(GUEST_INIT, "cat", HANDSHAKE_GUEST_PATH)]
     last = ""
     while time.monotonic() < deadline:
         try:
@@ -434,7 +453,8 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
             gone = True          # already reaped; either way it is not running
         if gone:
             raise click.UsageError(
-                f"qemu exited before the VM came up (cid {cid} already in use?)")
+                f"qemu exited before the VM came up (cid {cid} already in use?); "
+                f"{_console_hint()}")
         try:
             # A probe that blocks forever would stop the loop ever reaching the
             # deadline again, turning a failure into an indefinite hang -- which
@@ -442,23 +462,32 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
             r = subprocess.run(probe, capture_output=True, text=True,
                                timeout=PROBE_TIMEOUT)
         except subprocess.TimeoutExpired:
-            last = [f"ssh did not return within {PROBE_TIMEOUT:g}s"]
+            last = f"ssh did not return within {PROBE_TIMEOUT:g}s"
             continue
+
         if r.returncode == 0:
             if r.stdout.strip() == token:
                 return
             raise click.UsageError(
                 f"the VM answering on vsock/{cid} is not the one we started; "
                 "refusing to hand it the session")
-        # Keep why it failed. Discarding it meant a boot that could never work
-        # looked exactly like a boot that was merely slow, for ninety seconds.
-        last = (r.stderr or r.stdout).strip().splitlines()[-1:] or last
+
+        err = (r.stderr or r.stdout).strip()
+        tail = err.splitlines()[-1] if err else f"ssh exited {r.returncode}"
+        if r.returncode != SSH_FAILED:
+            # ssh itself worked, so the guest is up and waiting changes nothing:
+            # the init or the token failed, and that is a real error now.
+            raise click.UsageError(
+                f"the guest is up but could not hand back its token: {tail}")
+        if "Permission denied" in err or "publickey" in err:
+            raise click.UsageError(
+                "the guest refused our key -- the authorized-key credential did "
+                f"not reach it: {tail}")
+        last = tail or last
         time.sleep(SSH_RETRY_DELAY)
-    detail = f"\nlast ssh error: {last[0]}" if last else ""
     raise click.UsageError(
-        f"the VM did not answer on vsock/{cid} within {BOOT_TIMEOUT:g}s; the "
-        f"guest console is in {vm_image.cache_dir() / 'last-console.log'}"
-        f"{detail}")
+        f"the VM did not answer on vsock/{cid} within {BOOT_TIMEOUT:g}s; "
+        f"{_console_hint()}" + (f"\nlast ssh error: {last}" if last else ""))
 
 
 def _ssh_argv(key: Path, cid: int) -> list[str]:
@@ -585,5 +614,4 @@ def launch(spec: Launch) -> None:
         argv.append("-t")
     # ssh joins the remote command with spaces and the guest's shell splits it
     # again, so every element is quoted for that shell.
-    remote = " ".join(shlex.quote(a) for a in (GUEST_INIT, *inner))
-    os.execvp("ssh", [*argv, "--", remote])
+    os.execvp("ssh", [*argv, "--", _remote_command(GUEST_INIT, *inner)])
