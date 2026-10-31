@@ -450,8 +450,11 @@ def launch(spec: Launch) -> None:
     base = spec.image or DEFAULT_IMAGE
     if spec.image is None:
         ensure_image(base)
-    disk = vm_image.disk_for(base)
-    kernel, initrd = vm_image.boot_files(base)
+    # One digest for the guest image, shared by the disk and the boot files, so
+    # they cannot come from different builds.
+    digest = vm_image.guest_digest(base)
+    disk = vm_image.disk_for(digest)
+    kernel, initrd = vm_image.boot_files(digest)
 
     _sweep_stale()
     run_id = f"{os.getpid()}-{secrets.token_hex(3)}"

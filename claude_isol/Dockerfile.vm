@@ -4,15 +4,26 @@
 # systemd for the boot, and openssh because the console is an ssh session over
 # vsock: systemd-ssh-generator binds vsock::22 by itself when it detects a VM,
 # and activates openssh's shipped sshd@.service per connection, so neither needs
-# configuring here. mkinitcpio builds the *fallback* initramfs (no autodetect),
-# because autodetect would probe this build container's hardware rather than the
-# VM's and leave out the virtio modules the guest needs to find its root disk.
+# configuring here.
+#
+# Both boot files keep the names the linux package gives them. Installing linux
+# already runs mkinitcpio through its pacman hook, so the line below *replaces*
+# that image rather than adding a second one, and it replaces it for one reason:
+# the hook runs the 'default' preset, which includes autodetect, and autodetect
+# restricts the image to modules matching the machine it is built on. Here that
+# machine is the build container -- it reported "cannot detect type of overlayfs
+# root filesystem" and pulled in firmware for the host's amdgpu -- so the image
+# would likely carry no virtio_blk and the guest would never find /dev/vda.
+# -S autodetect is what the fallback preset would have produced, had this image
+# shipped one. `test -s` on both makes a missing boot file fail the build rather
+# than produce a VM that never answers.
 ARG BASE=claude-isolation:latest
 FROM ${BASE}
 
-RUN pacman -Syu --noconfirm --needed systemd openssh \
- && pacman -Syu --noconfirm --needed linux \
- && mkinitcpio -p linux
+RUN pacman -Syu --noconfirm --needed systemd openssh linux \
+ && mkinitcpio -k /boot/vmlinuz-linux -S autodetect -g /boot/initramfs-linux.img \
+ && test -s /boot/vmlinuz-linux \
+ && test -s /boot/initramfs-linux.img
 
 # claude runs as root here -- that is the point of this mode -- and virtiofsd
 # maps guest root to the launching user, so files land on the host owned by them.

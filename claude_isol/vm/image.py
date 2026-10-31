@@ -10,9 +10,9 @@ Three steps, none of which need root on the host:
                     no loop mount; run under `podman unshare` so the extracted
                     tree can keep its root-owned files
 
-The result is cached under ~/.cache/claude-isol/vm keyed by the *base* image's
-digest, the same trick install_claude_on_top uses for its layered tag: the disk
-is rebuilt only when the image it came from actually changed.
+Everything derived is cached under ~/.cache/claude-isol/vm, keyed by the digest
+of the *guest* image -- the thing that actually boots -- so an edit to either
+Dockerfile invalidates the disk and the kernel together.
 """
 from __future__ import annotations
 
@@ -25,6 +25,11 @@ from pathlib import Path
 from ..claude_isol import SCRIPT_DIR, image_id
 
 VM_TAG = "claude-isolation-vm:latest"
+# Where the linux package puts them. Dockerfile.vm regenerates the initramfs in
+# place, without autodetect, so this is the complete one rather than the
+# build-container-specific image the pacman hook leaves behind.
+GUEST_KERNEL = "/boot/vmlinuz-linux"
+GUEST_INITRD = "/boot/initramfs-linux.img"
 # Room for pacman, build trees and nested container images; the file is sparse,
 # so this costs what is actually written.
 DISK_SIZE = os.environ.get("CLAUDE_ISOL_VM_DISK", "40G")
@@ -41,28 +46,32 @@ def _run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, **kw)
 
 
-def build_vm_image(base_image: str) -> Path:
-    """Build the guest image from `base_image` and return the ext4 disk path."""
+def guest_digest(base_image: str) -> str:
+    """Build the guest image if needed and return the digest of what will boot.
+
+    Keyed on the *guest* image rather than the base: everything derived from it
+    is cached under this digest, and keying on the base meant an edit to
+    Dockerfile.vm produced a new image while the old disk and kernel were
+    quietly reused. podman's layer cache makes the rebuild a no-op when nothing
+    changed, so this can run every time."""
     _run(["podman", "build", "-f", str(SCRIPT_DIR / "Dockerfile.vm"),
           "--build-arg", f"BASE={base_image}", "-t", VM_TAG, str(SCRIPT_DIR)])
-    return VM_TAG  # type: ignore[return-value]
+    return image_id(VM_TAG)
 
 
-def disk_for(base_image: str) -> Path:
-    """The disk image for `base_image`, built on first use and cached after."""
-    digest = image_id(base_image)
+def disk_for(digest: str) -> Path:
+    """The disk for guest image `digest`, built on first use and cached after."""
     disk = cache_dir() / f"{digest[:16]}.ext4"
     if disk.exists():
         return disk
 
-    print(f"building the VM disk for {base_image} (first run; minutes)",
+    print("building the VM disk (first run for this image; minutes)",
           file=sys.stderr)
-    build_vm_image(base_image)
 
     work = cache_dir() / f".build-{digest[:16]}"
     shutil.rmtree(work, ignore_errors=True)
     work.mkdir()
-    tmp_disk = disk.with_suffix(".partial")
+    tmp_disk = disk.with_name(disk.name + ".partial")
     try:
         cid = subprocess.run(["podman", "create", VM_TAG],
                              capture_output=True, text=True,
@@ -88,20 +97,23 @@ def disk_for(base_image: str) -> Path:
     return disk
 
 
-def boot_files(base_image: str) -> tuple[Path, Path]:
-    """Kernel and initramfs for a direct boot, extracted from the image once and
-    cached beside the disk. Direct kernel boot keeps a bootloader out of the
-    picture; the fallback initramfs is the one with the virtio modules in it."""
-    digest = image_id(base_image)
+def boot_files(digest: str) -> tuple[Path, Path]:
+    """Kernel and initramfs for a direct boot, copied out of the guest image once
+    and cached beside the disk. Booting the kernel directly keeps a bootloader
+    out of the picture entirely."""
     kernel = cache_dir() / f"{digest[:16]}.vmlinuz"
     initrd = cache_dir() / f"{digest[:16]}.initrd"
     if kernel.exists() and initrd.exists():
         return kernel, initrd
 
-    for src, dst in (("/boot/vmlinuz-linux", kernel),
-                     ("/boot/initramfs-linux-fallback.img", initrd)):
-        tmp = dst.with_suffix(".partial")
+    for src, dst in ((GUEST_KERNEL, kernel), (GUEST_INITRD, initrd)):
+        # A distinct temp name per artefact: one shared ".partial" let two
+        # concurrent first runs write a rootfs into a kernel file.
+        tmp = dst.with_name(dst.name + ".partial")
         with tmp.open("wb") as fh:
             _run(["podman", "run", "--rm", VM_TAG, "cat", src], stdout=fh)
+        if tmp.stat().st_size == 0:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(f"{src} is empty in {VM_TAG}")
         tmp.replace(dst)
     return kernel, initrd
