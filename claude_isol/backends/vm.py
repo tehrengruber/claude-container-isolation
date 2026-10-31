@@ -158,10 +158,18 @@ def _spawn_reaper(run_dir: Path) -> int:
 
 
 def _stage_resolv(stage: Path) -> None:
-    """Pin the guest's resolver for --no-lan, for the same reason the other two
-    modes do: the host's own resolvers are usually on the LAN, and the egress
-    filter drops traffic there. Written with the rest of the staging, before the
-    share is served; the guest picks it up in vm_init.sh."""
+    """Give the guest a resolver it can actually reach.
+
+    passt will not offer one over DHCP that the guest cannot use, and on a host
+    running systemd-resolved /etc/resolv.conf names the 127.0.0.53 stub -- host
+    loopback, which is exactly what --no-map-gw declines to bridge. So passt
+    reports "no IPv4 nameserver available for DHCP", the guest gets none, and
+    resolved falls back to shouting LLMNR at a network that has no answer.
+
+    Under --no-lan a public resolver is required anyway: the host's own are
+    usually in the private ranges the egress filter drops. Written with the rest
+    of the staging, before the share is served; the guest picks it up in
+    vm_init.sh."""
     (stage / "resolv.conf").write_text(
         "".join(f"nameserver {ns}\n" for ns in PUBLIC_DNS))
 
@@ -501,8 +509,7 @@ def launch(spec: Launch) -> None:
     stage = _config_share(run_dir)
     token = secrets.token_hex(16)
     (stage / "handshake").write_text(token)
-    if spec.no_lan:
-        _stage_resolv(stage)
+    _stage_resolv(stage)
     volume_plan = _stage_volumes(spec.volumes, stage)
 
     prompt = None

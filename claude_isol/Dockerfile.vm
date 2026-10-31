@@ -35,6 +35,20 @@ RUN systemctl enable systemd-networkd systemd-resolved \
  && printf '[Match]\nName=en*\n\n[Network]\nDHCP=yes\n' \
         > /etc/systemd/network/80-claude-isol-dhcp.network
 
+# sshd on vsock port 22, which is how the host gets a console in here.
+#
+# systemd-ssh-generator would set this up by itself, but it is a generator: it
+# runs before any unit, and decides whether to bind AF_VSOCK by looking for
+# /dev/vsock -- which udev has not created yet that early, since the vsock
+# transport is a module. Declaring the socket instead means it is bound when
+# sockets.target is reached, by which time the device exists. Accept=yes
+# instantiates openssh's own sshd@.service per connection, so sshd still needs
+# no configuration and still picks up the authorized key from the credential the
+# host passes over SMBIOS.
+RUN printf '[Unit]\nDescription=OpenSSH on AF_VSOCK\n\n[Socket]\nListenStream=vsock::22\nAccept=yes\n\n[Install]\nWantedBy=sockets.target\n' \
+        > /etc/systemd/system/sshd.socket \
+ && systemctl enable sshd.socket
+
 # The guest side of the virtiofs shares. /work is the cwd; the config share is
 # mounted and its single files bind-mounted into place by claude-isol-vm-init,
 # which guest root may do freely.
