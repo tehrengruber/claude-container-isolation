@@ -1,31 +1,58 @@
 #!/usr/bin/env python3
 """--vm: claude as root in a QEMU virtual machine.
 
-The point of this mode is that the session has *more* power inside and the host
-has *more* protection outside: claude is root in its own kernel, free to run
-containers in whatever mode it likes, mount things and load modules, while the
-only ways back to the host are the three virtiofs shares and nothing else.
+The trade this mode makes is more power inside for more protection outside.
+Inside, claude is root in its own kernel: it can run containers in whatever mode
+it likes, mount filesystems, load modules. Outside, the host is behind a VM
+boundary instead of sharing a kernel with the sandbox.
 
-The shape follows the rest of the tool: fork the helpers with PR_SET_PDEATHSIG
-so they die with us, then exec the foreground process in place. Here that
-foreground process is `ssh`, which is what makes the terminal behave -- window
-resizes, signals, job control and the exit status are the ssh protocol's job
-rather than ours. The guest needs no sshd configuration for this:
-systemd-ssh-generator binds vsock::22 on its own when it detects a VM, and
-systemd-ssh-proxy on the host side turns `ssh vsock/<cid>` into a vsock connect.
+What the guest can actually touch on the host, which is the part worth being
+precise about:
+
+  * the virtiofs shares listed below, and nothing else in the filesystem;
+  * the network, through passt -- outbound only. passt is started with
+    --no-map-gw, so unlike QEMU's built-in user networking it does not offer
+    itself as a route to the host's own loopback services. With --no-lan, passt
+    also runs under the same eBPF egress cgroup filter the other two modes use;
+  * the vsock port its sshd listens on, which is reachable by any local user who
+    can open /dev/vsock but only answers pubkey auth against a per-run key.
+
+Within the shares, two things are enforced on the host side rather than in the
+guest, because the guest is root and can remount whatever it likes:
+
+  * the entries of ~/.claude that the *host's* claude would later execute --
+    settings.json, agents/, plugins/ and the rest of CLAUDE_CONFIG_RO -- are
+    read-only, so a session cannot write itself a hook that runs unsandboxed;
+  * the cfg share is read-only outright. It sits on the host's XDG_RUNTIME_DIR
+    tmpfs, which a guest able to write it could exhaust.
+
+Both are done by running each virtiofsd inside a bubblewrap mount namespace
+that holds only what the daemon needs plus its own share.
 
 Filesystem (see vm_init.sh for the guest half):
 
     cwd     $PWD            -> /work, the one read-write tree
-    claude  ~/.claude       -> /root/.claude
-    cfg     a per-run dir   -> /run/cfg, whose single files are bind-mounted
-                               into place inside the guest
+    claude  ~/.claude       -> /root/.claude, with CLAUDE_CONFIG_RO pinned ro
+    cfg     a per-run dir   -> /run/cfg, read-only; the guest copies out of it
+    vol<n>  each -v source  -> wherever that -v asked for
 
 virtiofsd maps guest root to the launching user (--translate-uid), so claude is
-root in the VM yet everything it writes to a share is owned by you on the host.
+root in the VM yet everything it writes to a share is owned by you on the host --
+the effect --userns=keep-id has in container mode, without a user namespace.
+
+The process shape follows the rest of the tool: fork the helpers with
+PR_SET_PDEATHSIG so they die with us, then exec the foreground process in place.
+Here that is `ssh`, which is what makes the terminal behave -- window resizes,
+signals, job control and the exit status are the ssh protocol's job rather than
+ours. The guest needs no sshd configuration: systemd-ssh-generator binds
+vsock::22 by itself when it detects a VM, and systemd-ssh-proxy turns
+`ssh vsock/<cid>` into a vsock connect. Nothing is sent to that VM until it has
+read back a secret from its own cfg share, since a cid cannot be reserved in
+advance and another local VM could otherwise be answering.
 """
 from __future__ import annotations
 
+import fcntl
 import os
 import secrets
 import shlex
@@ -40,8 +67,8 @@ import click
 
 from ..claude_isol import (CLAUDE_CONFIG_RO, DEFAULT_IMAGE, HOME, PUBLIC_DNS,
                            _prompt_index, confirm_cwd_submounts, ensure_image,
-                           set_parent_death_signal, setup_nolan_cgroup,
-                           stdin_from_text)
+                           parse_volume, runtime_dir, set_parent_death_signal,
+                           setup_nolan_cgroup, stdin_from_text)
 from ..launch import Launch
 from ..vm import image as vm_image
 
@@ -57,29 +84,40 @@ BOOT_TIMEOUT = 90.0        # generous: a cold page cache plus systemd
 SSH_RETRY_DELAY = 0.3
 
 
-def _runtime_dir() -> Path:
-    rd = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    d = Path(rd) / "claude-isol"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
 def _run_dir(run_id: str) -> Path:
     """Everything this run creates lives here: the ephemeral ssh key, the staged
-    credentials, the virtiofsd sockets. One directory means one thing to remove."""
-    d = _runtime_dir() / f"run-{run_id}"
+    credentials, the virtiofsd sockets. One directory means one thing to remove.
+
+    A lock file in it marks the run as live. The fd is deliberately inheritable,
+    so it survives the exec into ssh and the kernel holds the lock for exactly as
+    long as the session does -- including through a SIGKILL, which the reaper
+    cannot survive. _sweep_stale() reads that rather than guessing from a pid."""
+    d = runtime_dir() / f"run-{run_id}"
     d.mkdir(mode=0o700, exist_ok=True)
+    fd = os.open(d / "lock", os.O_CREAT | os.O_WRONLY, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    os.set_inheritable(fd, True)
     return d
 
 
 def _sweep_stale() -> None:
     """Drop run directories whose session is gone -- a crash, a SIGKILL, or a
-    reboot that left the runtime dir behind. The run id starts with the launcher's
-    pid, so a live session is easy to tell from a dead one."""
-    for d in _runtime_dir().glob("run-*"):
-        pid = d.name.removeprefix("run-").split("-")[0]
-        if pid.isdigit() and Path(f"/proc/{pid}").exists():
-            continue
+    reboot that left the runtime dir behind.
+
+    Liveness is whether the run's lock is still held. Keying it on /proc/<pid>
+    instead would be defeated by pid reuse, which on a 32k-pid box takes
+    minutes: the sweep would then skip that directory forever and leave a
+    private key and credential copies behind until the next reboot."""
+    for d in runtime_dir().glob("run-*"):
+        lock = d / "lock"
+        if lock.exists():
+            fd = os.open(lock, os.O_RDONLY)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                continue            # still held: a live session
+            finally:
+                os.close(fd)        # releases our probe lock with it
         shutil.rmtree(d, ignore_errors=True)
 
 
@@ -229,6 +267,33 @@ def _spawn_virtiofsd(tag: str, shared: Path, run_dir: Path,
             wrap += ["--ro-bind", str(src), str(src)]
     _spawn([*wrap, "--", *inner], ready=sock.is_socket)
     return sock
+
+
+def _stage_volumes(volumes: list[str], stage: Path) -> list[tuple[str, Path, bool]]:
+    """Check each -v and tell the guest where to mount it.
+
+    virtiofs shares directories, so a file source is refused rather than quietly
+    widened: sharing its parent would hand the guest every sibling, which is
+    emphatically not what `-v ~/.ssh/config:/x` asks for. The mount points are
+    the guest's business, so they travel as a table in the cfg share -- written
+    here, before that share is served (see vm_init.sh for the other half)."""
+    plan: list[tuple[str, Path, bool]] = []
+    table: list[str] = []
+    for i, vol in enumerate(volumes):
+        src, dst, opts = parse_volume(vol)
+        path = Path(src).resolve()
+        if not path.is_dir():
+            raise click.UsageError(
+                f"-v {vol}: --vm can only share directories, and {src} is not "
+                "one (virtiofs has no way to share a single file; share its "
+                "directory, or use --prompt-file for a prompt)")
+        ro = "ro" in opts.split(",")
+        tag = f"vol{i}"
+        plan.append((tag, path, ro))
+        table.append(f"{tag}\t{dst}\t{'ro' if ro else 'rw'}")
+    if table:
+        (stage / "mounts").write_text("\n".join(table) + "\n")
+    return plan
 
 
 def _config_share(run_dir: Path) -> Path:
@@ -392,6 +457,7 @@ def launch(spec: Launch) -> None:
     (stage / "handshake").write_text(token)
     if spec.no_lan:
         _stage_resolv(stage)
+    volume_plan = _stage_volumes(spec.volumes, stage)
 
     prompt = None
     if spec.drop_shell:
@@ -440,6 +506,8 @@ def launch(spec: Launch) -> None:
         # session. The guest copies what it needs out instead (vm_init.sh).
         "cfg": _spawn_virtiofsd("cfg", stage, run_dir, writable=False),
     }
+    for tag, path, ro in volume_plan:
+        socks[tag] = _spawn_virtiofsd(tag, path, run_dir, writable=not ro)
 
     key, pubkey = _ssh_key(run_dir)
     cid = _pick_cid()

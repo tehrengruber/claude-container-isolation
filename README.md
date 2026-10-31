@@ -251,7 +251,13 @@ rebuilt only when the image changes.
 | --- | --- | --- |
 | `cwd` | the working directory | `/work`, the one read-write tree |
 | `claude` | `~/.claude` | `/root/.claude` |
-| `cfg` | a per-run staging dir | `/run/cfg`, bind-mounted onto single paths |
+| `cfg` | a per-run staging dir | `/run/cfg`, read-only; the guest copies out of it |
+| `vol<n>` | each `-v` source | wherever that `-v` asked for |
+
+`-v src:dst[:ro]` works here too, one virtiofs share per source. Only
+directories: virtiofs cannot share a single file, and sharing its parent instead
+would hand the guest every sibling, so a file source is refused rather than
+quietly widened.
 
 virtiofsd maps guest uid 0 to the launching user, so claude is root inside the VM
 and yet everything it writes to a share is owned by you on the host — the same

@@ -17,6 +17,7 @@ import os
 import pwd
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -88,6 +89,38 @@ PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
 
 
+def runtime_dir() -> Path:
+    """`$XDG_RUNTIME_DIR/claude-isol`, checked rather than assumed.
+
+    Private keys, credential copies and the --host-exec socket all live here, on
+    the assumption that it is a directory we own that nobody else can enter. That
+    holds for a logind session; it does not hold if XDG_RUNTIME_DIR is unset and
+    shared, or points into /tmp, where another user could have pre-created the
+    path. mkdir(exist_ok=True) would not notice -- it leaves an existing
+    directory's mode alone and follows a symlink -- so check explicitly.
+    """
+    base = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
+    d = base / "claude-isol"
+    d.mkdir(parents=True, exist_ok=True)
+    for p in (base, d):
+        st = p.lstat()
+        if stat.S_ISLNK(st.st_mode):
+            raise click.UsageError(f"{p} is a symlink; refusing to put session "
+                                   "state behind it")
+        if st.st_uid != os.getuid():
+            raise click.UsageError(f"{p} is not owned by you (uid {st.st_uid}); "
+                                   "refusing to put session state there")
+        if st.st_mode & 0o077:
+            if p == d:
+                p.chmod(0o700)   # ours to tighten
+            else:
+                raise click.UsageError(
+                    f"{p} is accessible to other users (mode "
+                    f"{stat.S_IMODE(st.st_mode):04o}); refusing to put session "
+                    "state there")
+    return d
+
+
 def set_parent_death_signal(sig: int) -> None:
     if _LIBC.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
@@ -98,6 +131,13 @@ def find_ide_lock(cwd: Path) -> Optional[Path]:
     if not ide_dir.is_dir():
         return None
     for lock in ide_dir.glob("*.lock"):
+        # The name is the port, and this directory is writable by the session,
+        # which then hands it to spawn_proxy() to interpolate into the proxy's
+        # ws://127.0.0.1:<port> upstream. A planted `8080.lock` would aim the
+        # next launch at a host service; `80@evil.example` would redirect the URL
+        # outright. Only a plain unprivileged port is accepted.
+        if not (lock.stem.isdigit() and 1024 <= int(lock.stem) <= 65535):
+            continue
         try:
             data = json.loads(lock.read_text())
         except Exception:
@@ -216,8 +256,7 @@ def notify_hooks_settings() -> dict:
 def notify_wiring() -> tuple[list[str], list[str], list[str]]:
     """Return (podman_mounts, podman_env, claude_args) for host notifications,
     or empty lists when the notifyd socket isn't present (daemon not running)."""
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    sock = Path(runtime) / "claude-isol" / "notify.sock"
+    sock = runtime_dir() / "notify.sock"
     if not sock.is_socket():
         return [], [], []
     mounts = [
@@ -580,13 +619,7 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
     # User -v specs, translated from podman's src:dst[:opts] to bwrap binds.
     # Placed last so the user can override anything bound above.
     for spec in volumes:
-        parts = spec.split(":")
-        if len(parts) == 1:
-            src = dst = parts[0]
-            opts = ""
-        else:
-            src, dst = parts[0], parts[1]
-            opts = parts[2] if len(parts) > 2 else ""
+        src, dst, opts = parse_volume(spec)
         flag = "--ro-bind" if "ro" in opts.split(",") else "--bind"
         cmd += [flag, src, dst]
 
@@ -716,8 +749,7 @@ def spawn_hostexecd(cwd: Path, label: str) -> Path:
     torn down the moment the exec'd podman exits, and we wait for its ready line
     -- podman needs the socket to exist before it can bind-mount it.
     """
-    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-    sock = Path(runtime) / "claude-isol" / f"hostexec-{uuid.uuid4().hex}.sock"
+    sock = runtime_dir() / f"hostexec-{uuid.uuid4().hex}.sock"
 
     ready_r, ready_w = os.pipe()
     pid = os.fork()
@@ -765,6 +797,15 @@ def hostexec_wiring(cwd: Path) -> tuple[list[str], list[str], list[str]]:
         "timeout": HOSTEXEC_CALL_TIMEOUT_MS,
     }}}
     return mounts, env, ["--mcp-config", json.dumps(mcp_config)]
+
+
+def parse_volume(spec: str) -> tuple[str, str, str]:
+    """A -v spec as (src, dst, opts), in podman's SRC:DST[:OPTS] spelling. A bare
+    path means the same location on both sides."""
+    parts = spec.split(":")
+    if len(parts) == 1:
+        return parts[0], parts[0], ""
+    return parts[0], parts[1], parts[2] if len(parts) > 2 else ""
 
 
 def _validate_volume(ctx, param, value):

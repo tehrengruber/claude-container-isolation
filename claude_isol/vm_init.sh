@@ -36,4 +36,19 @@ fi
 # address -- which the host's own resolvers usually are.
 copy_in /run/cfg/resolv.conf /etc/resolv.conf
 
+# Each -v arrives as its own virtiofs tag; where it goes is in this table rather
+# than baked into the host side, because the mount point is the guest's business.
+if [ -r /run/cfg/mounts ]; then
+    while IFS=$'\t' read -r tag dst opts; do
+        [ -n "${tag:-}" ] || continue
+        mkdir -p "$dst" 2>/dev/null
+        mountpoint -q "$dst" && continue
+        if [ "$opts" = "ro" ]; then
+            mount -t virtiofs -o ro "$tag" "$dst"
+        else
+            mount -t virtiofs "$tag" "$dst"
+        fi
+    done < /run/cfg/mounts
+fi
+
 exec "$@"
