@@ -76,6 +76,10 @@ DEFAULT_MEMORY = "8G"
 GUEST_INIT = "/usr/local/bin/claude-isol-vm-init"
 CFG_GUEST_DIR = "/run/cfg"
 HANDSHAKE_GUEST_PATH = f"{CFG_GUEST_DIR}/handshake"
+# systemd's helper that turns a vsock/<cid> host into an AF_VSOCK connection.
+# ssh learns about it from a drop-in in the system ssh_config, which -F /dev/null
+# discards, so the path is named here instead.
+SSH_PROXY = "/usr/lib/systemd/systemd-ssh-proxy"
 # What virtiofsd needs in its own mount namespace, and nothing else: it serves
 # only --shared-dir, so anything not bound here is out of reach even if its path
 # resolution were tricked.
@@ -184,6 +188,10 @@ def _require(*binaries: str) -> None:
         raise click.UsageError(
             "--vm needs access to /dev/kvm (join the 'kvm' group); software "
             "emulation is far too slow to be useful here")
+    if not Path(SSH_PROXY).exists():
+        raise click.UsageError(
+            f"--vm needs {SSH_PROXY} to reach the guest over vsock "
+            "(systemd 256 or newer)")
 
 
 def _pick_cid() -> int:
@@ -403,6 +411,7 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
     any other reason, waiting the full timeout would hide the real error."""
     deadline = time.monotonic() + BOOT_TIMEOUT
     probe = _ssh_argv(key, cid) + ["--", "cat", HANDSHAKE_GUEST_PATH]
+    last = ""
     while time.monotonic() < deadline:
         try:
             gone = bool(os.waitpid(qemu_pid, os.WNOHANG)[0])
@@ -418,18 +427,27 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
             raise click.UsageError(
                 f"the VM answering on vsock/{cid} is not the one we started; "
                 "refusing to hand it the session")
+        # Keep why it failed. Discarding it meant a boot that could never work
+        # looked exactly like a boot that was merely slow, for ninety seconds.
+        last = (r.stderr or r.stdout).strip().splitlines()[-1:] or last
         time.sleep(SSH_RETRY_DELAY)
+    detail = f"\nlast ssh error: {last[0]}" if last else ""
     raise click.UsageError(
         f"the VM did not answer on vsock/{cid} within {BOOT_TIMEOUT:g}s; the "
-        f"guest console is in {vm_image.cache_dir() / 'last-console.log'}")
+        f"guest console is in {vm_image.cache_dir() / 'last-console.log'}"
+        f"{detail}")
 
 
 def _ssh_argv(key: Path, cid: int) -> list[str]:
     return [
-        # -F /dev/null: the user's ssh_config must not be able to redirect this
-        # connection (a `Host *` ProxyCommand would), and nothing in it applies
-        # to a throwaway VM anyway.
+        # -F /dev/null so the user's ssh_config cannot redirect this connection
+        # (a `Host *` ProxyCommand would). That also discards the system-wide
+        # drop-in systemd ships -- which is the only thing that teaches ssh what
+        # a vsock/<cid> host *is* -- so its two options are passed explicitly.
+        # Without them ssh treats "vsock/<cid>" as a hostname and tries DNS.
         "ssh", "-q", "-F", "/dev/null", "-i", str(key),
+        "-o", f"ProxyCommand={SSH_PROXY} %h %p", "-o", "ProxyUseFdpass=yes",
+        "-o", "CheckHostIP=no",
         # The "host" is a fresh VM every time, so a known_hosts entry would be
         # noise at best; the transport is a private vsock, not a network.
         "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
