@@ -35,6 +35,11 @@ from pathlib import Path
 from typing import Optional
 
 MAX_OUTPUT = 64 * 1024  # per stream, as much as is useful to hand back to Claude
+# A command has to be readable in a dialog box to be approvable, so anything
+# longer than this is refused rather than shown truncated and run in full.
+MAX_COMMAND = 4096
+DISPLAY_LINES = 15
+DISPLAY_CHARS = 2000
 DEFAULT_TIMEOUT = 600.0
 MAX_TIMEOUT = 3600.0
 DIALOG_TIMEOUT = 300.0  # an unanswered prompt is a denied prompt
@@ -52,10 +57,33 @@ def _clip(raw: bytes) -> str:
     return text
 
 
+def _escape_markup(text: str) -> str:
+    """Every dialog backend here renders markup -- Pango for zenity, Qt's
+    AutoText for kdialog, body-markup for notification servers -- so a command
+    containing tags could hide part of itself from the dialog while `bash -lc`
+    ran all of it. The dialog is the whole security boundary for this feature, so
+    what it shows has to be what runs."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _for_display(command: str) -> str:
+    """The command as the dialog should show it: bounded, so a few hundred
+    newlines cannot scroll the real payload out of a clipped window, and with
+    what was left out stated rather than silently dropped."""
+    lines = command.splitlines() or [""]
+    shown = lines[:DISPLAY_LINES]
+    text = "\n".join(shown)
+    if len(lines) > DISPLAY_LINES or len(command) > DISPLAY_CHARS:
+        text = text[:DISPLAY_CHARS]
+        text += (f"\n[... {len(lines)} lines, {len(command)} bytes in total; "
+                 f"showing the first {len(shown)}]")
+    return text
+
+
 def _prompt_text(command: str, cwd: Path, label: str) -> str:
     who = f"Claude ({label})" if label else "Claude"
     return (f"{who} wants to run this on the host, outside the sandbox:\n\n"
-            f"{command}\n\nWorking directory: {cwd}")
+            f"{_for_display(command)}\n\nWorking directory: {cwd}")
 
 
 def _run_dialog(argv: list[str]) -> bool:
@@ -72,18 +100,19 @@ def _ask_zenity(text: str) -> Optional[bool]:
     exe = shutil.which("zenity")
     if exe is None:
         return None
-    # zenity renders --text as Pango markup, so the command has to be escaped.
-    escaped = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     return _run_dialog([exe, "--question", "--width=600", "--title", TITLE,
                         "--ok-label=Run on host", "--cancel-label=Deny",
-                        "--text", escaped])
+                        "--text", _escape_markup(text)])
 
 
 def _ask_kdialog(text: str) -> Optional[bool]:
     exe = shutil.which("kdialog")
     if exe is None:
         return None
-    return _run_dialog([exe, "--title", TITLE, "--warningyesno", text,
+    # KMessageBox renders with Qt::AutoText: mightBeRichText() on a command
+    # containing a tag switches the label to HTML, which can hide the payload.
+    return _run_dialog([exe, "--title", TITLE, "--warningyesno",
+                        _escape_markup(text),
                         "--yes-label", "Run on host", "--no-label", "Deny"])
 
 
@@ -120,7 +149,8 @@ def _ask_notification(text: str) -> Optional[bool]:
     try:
         # urgency critical + expire_timeout 0: the prompt must not time itself out.
         out = _gdbus("org.freedesktop.Notifications.Notify",
-                     "claude-isol", "0", "dialog-question", TITLE, text,
+                     "claude-isol", "0", "dialog-question", TITLE,
+                     _escape_markup(text),
                      "['run', 'Run on host', 'deny', 'Deny']",
                      "{'urgency': <byte 2>}", "0")
         m = re.search(r"uint32\s+(\d+)", out or "")  # gdbus prints "(uint32 N,)"
@@ -196,6 +226,12 @@ def handle(conn: socket.socket, cwd: Path, label: str) -> None:
             raise ValueError("empty command")
     except Exception:
         reply(conn, {"error": "malformed request"})
+        return
+
+    if len(command.encode("utf-8", "replace")) > MAX_COMMAND:
+        reply(conn, {"error": f"command longer than {MAX_COMMAND} bytes; it has to "
+                              f"be readable in a dialog to be approved -- put it "
+                              f"in a script and ask to run that instead"})
         return
 
     try:
