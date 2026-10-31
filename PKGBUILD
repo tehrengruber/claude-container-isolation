@@ -8,6 +8,9 @@ arch=('any')
 license=('custom')
 depends=('podman' 'python' 'python-websockets' 'python-click' 'glib2')
 optdepends=('bubblewrap: for --local host-sandbox mode (no container)'
+            'qemu-base: for --vm mode (also needs virtiofsd and /dev/kvm)'
+            'virtiofsd: shares the working directory into the --vm guest'
+            'openssh: the --vm console is an ssh session over vsock'
             'zenity: confirmation dialogs for --host-exec (a desktop notification otherwise)'
             'libbpf: for --no-lan (block LAN, keep internet)'
             'systemd: for --no-lan in non-delegated sessions (SSH/TTY/IDE terminals)')

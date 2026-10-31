@@ -38,6 +38,10 @@ container, with an MCP-filtering proxy in front of the JetBrains IDE link.
 | `claude_isol/notify_client.py` | In-container hook forwarder that reports session state to the daemon. |
 | `claude_isol/host_execd.py` | Host-side executor for `--host-exec`; prompts, then runs the command. |
 | `claude_isol/host_mcp.py` | In-container MCP server exposing the `mcp__host__run` tool. |
+| `claude_isol/launch.py` | What the CLI collected, and which flags belong to which mode. |
+| `claude_isol/backends/` | One module per mode (`container`, `local`, `vm`), one `launch()` each. |
+| `claude_isol/vm/image.py` | Builds and caches the bootable disk for `--vm` from the container image. |
+| `claude_isol/Dockerfile.vm` | Guest image: the container image plus a kernel, systemd and sshd. |
 | `pyproject.toml` | Python package definition (`pip install` entry point). |
 | `PKGBUILD` | Arch package definition for `claude-isol`. |
 
@@ -46,6 +50,7 @@ container, with an MCP-filtering proxy in front of the JetBrains IDE link.
 - `podman` (with `pasta` networking)
 - Python 3.11+ with `websockets` and `click`
 - `bubblewrap` (only for `--local` mode)
+- `qemu-base`, `virtiofsd`, `openssh` and access to `/dev/kvm` (only for `--vm`)
 
 ## Installing
 
@@ -71,6 +76,8 @@ claude-isol --shell                 # drop into bash inside the container
                                     # (handy for `gh auth login` etc.)
 claude-isol --image NAME            # run a prebuilt image as-is
 claude-isol --local                 # run on the host in a bubblewrap sandbox
+claude-isol --vm                    # run in a QEMU VM: root inside, host behind
+                                    # the VM boundary (needs /dev/kvm)
 claude-isol --tmpfs-home            # mount HOME as a fresh tmpfs (ephemeral home;
                                     # under --local, keeps HOME writable)
 claude-isol -v /data:/data          # add extra mounts (repeatable, both modes)
@@ -219,6 +226,50 @@ own, Claude vets a lock file by signal-probing the pid recorded inside it and
 walking its process tree looking for that pid — questions only the host's PID
 namespace can answer. Naming the port satisfies the lookup directly, so host
 processes stay out of reach from inside the container.
+
+## VM mode (`--vm`)
+
+`claude-isol --vm` boots a QEMU virtual machine where claude is **root in its own
+kernel** — free to run containers in whatever mode it likes, mount filesystems
+and load modules — while the host sits behind the VM boundary rather than sharing
+a kernel with it. More power inside, more protection outside.
+
+```sh
+claude-isol --vm                       # 8G, half the host's cores
+claude-isol --vm --vm-memory 16G --vm-cpus 8
+```
+
+Requires `/dev/kvm` (join the `kvm` group), plus `qemu-base`, `virtiofsd` and
+`openssh`. The first run builds a bootable disk from the container image and
+caches it under `~/.cache/claude-isol/vm`, keyed by that image's digest, so it is
+rebuilt only when the image changes.
+
+**What the guest can see.** Three virtiofs shares and nothing else:
+
+| share | host | guest |
+| --- | --- | --- |
+| `cwd` | the working directory | `/work`, the one read-write tree |
+| `claude` | `~/.claude` | `/root/.claude` |
+| `cfg` | a per-run staging dir | `/run/cfg`, bind-mounted onto single paths |
+
+virtiofsd maps guest uid 0 to the launching user, so claude is root inside the VM
+and yet everything it writes to a share is owned by you on the host — the same
+effect `--userns=keep-id` has in container mode. The scoped `gh`/`git`
+credentials are copied into the staging directory, because virtiofs can share
+directories but not individual files; `vm_init.sh` bind-mounts them into place
+inside the guest.
+
+**The console is an ssh session over vsock.** That is what makes window resizes,
+signals, job control and the exit status behave: they are the ssh protocol's
+job. Nothing is configured in the guest for it — `systemd-ssh-generator` binds
+`vsock::22` by itself when it detects a VM and activates openssh's shipped
+`sshd@.service` per connection, and `systemd-ssh-proxy` on the host turns
+`ssh vsock/<cid>` into a vsock connect. The key is an ephemeral keypair per run,
+its public half delivered as a systemd credential over SMBIOS. Agent forwarding
+is explicitly off, so the VM never sees the host's keys.
+
+Not wired up in this mode: host notifications, `--host-exec`, the JetBrains MCP
+proxy and `--no-lan`.
 
 ## Local sandbox mode (`--local`)
 

@@ -1,0 +1,30 @@
+# Guest image for --vm, layered on the container image so there is one source of
+# truth for what is installed.
+#
+# systemd for the boot, and openssh because the console is an ssh session over
+# vsock: systemd-ssh-generator binds vsock::22 by itself when it detects a VM,
+# and activates openssh's shipped sshd@.service per connection, so neither needs
+# configuring here. mkinitcpio builds the *fallback* initramfs (no autodetect),
+# because autodetect would probe this build container's hardware rather than the
+# VM's and leave out the virtio modules the guest needs to find its root disk.
+ARG BASE=claude-isolation:latest
+FROM ${BASE}
+
+RUN pacman -Syu --noconfirm --needed systemd openssh \
+ && pacman -Syu --noconfirm --needed linux \
+ && mkinitcpio -p linux
+
+# claude runs as root here -- that is the point of this mode -- and virtiofsd
+# maps guest root to the launching user, so files land on the host owned by them.
+# Nothing in HOME is read-only inside the VM; the isolation boundary is the VM.
+RUN systemctl enable systemd-networkd systemd-resolved
+
+# The guest side of the virtiofs shares. /work is the cwd; the config share is
+# mounted and its single files bind-mounted into place by claude-isol-vm-init,
+# which guest root may do freely.
+RUN mkdir -p /work /run/cfg
+
+COPY vm_init.sh /usr/local/bin/claude-isol-vm-init
+RUN chmod 0755 /usr/local/bin/claude-isol-vm-init
+
+CMD ["/bin/bash"]
