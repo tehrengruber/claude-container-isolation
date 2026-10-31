@@ -363,7 +363,13 @@ def _qemu_argv(spec: Launch, disk: Path, kernel: Path, initrd: Path,
         "-object", f"memory-backend-memfd,id=mem,size={mem},share=on",
         "-numa", "node,memdev=mem",
         "-kernel", str(kernel), "-initrd", str(initrd),
-        "-append", "root=/dev/vda rw console=ttyS0 systemd.show_status=0 loglevel=3",
+        # systemd.firstboot=off: the rootfs comes from `podman export` and so has
+        # no /etc/machine-id, which makes systemd treat every boot as the first
+        # one and run systemd-firstboot interactively -- it sits on this console
+        # asking for a timezone, before sysinit.target, and sshd.socket never
+        # starts. There is nobody to answer it.
+        "-append", "root=/dev/vda rw console=ttyS0 systemd.firstboot=off "
+                   "systemd.show_status=0 loglevel=3",
         # -snapshot is what makes the guest disk ephemeral *and* safe to share:
         # the cached image is opened read-only and every write goes to a temporary
         # overlay, so concurrent VMs cannot corrupt each other (or the cache), and

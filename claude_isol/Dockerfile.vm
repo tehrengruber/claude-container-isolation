@@ -27,8 +27,13 @@ RUN pacman -Syu --noconfirm --needed systemd openssh linux \
 
 # claude runs as root here -- that is the point of this mode -- and virtiofsd
 # maps guest root to the launching user, so files land on the host owned by them.
-# Nothing in HOME is read-only inside the VM; the isolation boundary is the VM.
-RUN systemctl enable systemd-networkd systemd-resolved
+#
+# networkd does nothing for an interface no .network file matches, so the virtio
+# NIC needs one or the guest comes up with no address at all and passt's DHCP
+# offer goes unanswered.
+RUN systemctl enable systemd-networkd systemd-resolved \
+ && printf '[Match]\nName=en*\n\n[Network]\nDHCP=yes\n' \
+        > /etc/systemd/network/80-claude-isol-dhcp.network
 
 # The guest side of the virtiofs shares. /work is the cwd; the config share is
 # mounted and its single files bind-mounted into place by claude-isol-vm-init,

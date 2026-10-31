@@ -33,8 +33,13 @@ fi
 
 # --no-lan pins a public resolver: the guest's queries are re-originated by passt
 # on the host, where the egress filter drops anything bound for a private
-# address -- which the host's own resolvers usually are.
-copy_in /run/cfg/resolv.conf /etc/resolv.conf
+# address -- which the host's own resolvers usually are. /etc/resolv.conf is a
+# symlink into resolved's state here, so it is removed first: copying onto it
+# would write through the link, into a file resolved owns and rewrites.
+if [ -r /run/cfg/resolv.conf ]; then
+    rm -f /etc/resolv.conf
+    cp -f /run/cfg/resolv.conf /etc/resolv.conf
+fi
 
 # Each -v arrives as its own virtiofs tag; where it goes is in this table rather
 # than baked into the host side, because the mount point is the guest's business.
