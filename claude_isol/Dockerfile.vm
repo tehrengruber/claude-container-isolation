@@ -55,10 +55,10 @@ RUN printf '[Unit]\nDescription=OpenSSH on AF_VSOCK\n\n[Socket]\nListenStream=vs
  && systemctl enable sshd.socket \
  && echo vmw_vsock_virtio_transport > /etc/modules-load.d/claude-isol-vsock.conf
 
-# The guest side of the virtiofs shares. /work is the cwd; the config share is
-# mounted and its single files bind-mounted into place by claude-isol-vm-init,
-# which guest root may do freely.
-RUN mkdir -p /work /run/cfg
+# The cwd's mount point. The other mount points are made by
+# claude-isol-vm-init at run time, not here: they live under /run, which systemd
+# replaces with a fresh tmpfs at boot, so anything created here would be gone.
+RUN mkdir -p /work
 
 COPY vm_init.sh /usr/local/bin/claude-isol-vm-init
 RUN chmod 0755 /usr/local/bin/claude-isol-vm-init

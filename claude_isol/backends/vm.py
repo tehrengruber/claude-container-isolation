@@ -94,6 +94,11 @@ def _console_hint() -> str:
     return f"guest console: {vm_image.cache_dir() / 'last-console.log'}"
 
 
+def _indent(text: str, limit: int = 8) -> str:
+    lines = text.splitlines()[:limit]
+    return "\n".join(f"    {l}" for l in lines)
+
+
 def _remote_command(*argv: str) -> str:
     """One string for ssh to hand the guest's shell, quoted for it. ssh joins a
     remote command with spaces and the far shell splits it again, so quoting
@@ -476,9 +481,12 @@ def _wait_for_guest(key: Path, cid: int, token: str, qemu_pid: int) -> None:
         tail = err.splitlines()[-1] if err else f"ssh exited {r.returncode}"
         if r.returncode != SSH_FAILED:
             # ssh itself worked, so the guest is up and waiting changes nothing:
-            # the init or the token failed, and that is a real error now.
+            # the init or the token failed, and that is a real error now. All of
+            # the guest's complaint is reported, not just the last line: the
+            # first one is usually the cause and the last one its consequence.
             raise click.UsageError(
-                f"the guest is up but could not hand back its token: {tail}")
+                "the guest is up but could not hand back its token:\n"
+                + _indent(err or tail))
         if "Permission denied" in err or "publickey" in err:
             raise click.UsageError(
                 "the guest refused our key -- the authorized-key credential did "

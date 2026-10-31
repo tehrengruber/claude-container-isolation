@@ -1,5 +1,9 @@
 #!/bin/bash
-# Guest-side setup for --vm, run by the ssh session before claude starts.
+# Guest-side setup for --vm, run by the ssh session before the real command.
+#
+# Mounts the virtiofs shares and puts the single config files in place. Mount
+# points are created here rather than in the image: /run is a fresh tmpfs by the
+# time this runs, so anything the image put under it is gone.
 #
 # The cfg share is mounted read-only -- it lives on the host's $XDG_RUNTIME_DIR
 # tmpfs, and a guest that could write it could exhaust that tmpfs and take the
@@ -13,11 +17,23 @@
 # would later execute pinned read-only on that side (see CLAUDE_CONFIG_RO).
 set -u
 
-mountpoint -q /work || mount -t virtiofs cwd /work
-mountpoint -q /run/cfg || mount -t virtiofs -o ro cfg /run/cfg
+die() { echo "claude-isol-vm-init: $*" >&2; exit 1; }
 
-mkdir -p /root/.claude /root/.config/gh
-mountpoint -q /root/.claude || mount -t virtiofs claude /root/.claude
+mount_tag() {  # mount_tag <virtiofs tag> <mount point> [mount options]
+    mkdir -p "$2" || die "cannot create $2"
+    mountpoint -q "$2" && return 0
+    if [ -n "${3:-}" ]; then
+        mount -t virtiofs -o "$3" "$1" "$2" || die "mounting '$1' on $2 failed"
+    else
+        mount -t virtiofs "$1" "$2" || die "mounting '$1' on $2 failed"
+    fi
+}
+
+mount_tag cwd /work
+mount_tag cfg /run/cfg ro
+mount_tag claude /root/.claude
+
+mkdir -p /root/.config/gh
 
 copy_in() {  # copy_in <source in the cfg share> <target>
     [ -e "$1" ] || return 0
@@ -31,11 +47,9 @@ if [ -d /run/cfg/gh ]; then
     chmod -R u+w /root/.config/gh 2>/dev/null || true
 fi
 
-# --no-lan pins a public resolver: the guest's queries are re-originated by passt
-# on the host, where the egress filter drops anything bound for a private
-# address -- which the host's own resolvers usually are. /etc/resolv.conf is a
-# symlink into resolved's state here, so it is removed first: copying onto it
-# would write through the link, into a file resolved owns and rewrites.
+# The resolver the host staged. /etc/resolv.conf is a symlink into resolved's
+# state here, so it is removed first: copying onto it would write through the
+# link, into a file resolved owns and rewrites.
 if [ -r /run/cfg/resolv.conf ]; then
     rm -f /etc/resolv.conf
     cp -f /run/cfg/resolv.conf /etc/resolv.conf
@@ -46,12 +60,10 @@ fi
 if [ -r /run/cfg/mounts ]; then
     while IFS=$'\t' read -r tag dst opts; do
         [ -n "${tag:-}" ] || continue
-        mkdir -p "$dst" 2>/dev/null
-        mountpoint -q "$dst" && continue
         if [ "$opts" = "ro" ]; then
-            mount -t virtiofs -o ro "$tag" "$dst"
+            mount_tag "$tag" "$dst" ro
         else
-            mount -t virtiofs "$tag" "$dst"
+            mount_tag "$tag" "$dst"
         fi
     done < /run/cfg/mounts
 fi
