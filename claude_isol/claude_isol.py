@@ -62,6 +62,28 @@ HOSTEXEC_DAEMON_SRC = SCRIPT_DIR / "host_execd.py"
 # daemon will run (DIALOG_TIMEOUT + MAX_TIMEOUT in host_execd.py), with room to spare.
 HOSTEXEC_CALL_TIMEOUT_MS = 4_200_000
 
+# What --local forwards into the sandbox. Everything else is dropped (see the
+# --clearenv in build_bwrap_cmd): the point of the scoped gh/git credentials is
+# that the session never sees the host's real ones, and an exported GH_TOKEN or
+# ANTHROPIC_API_KEY in the launching shell would hand them over anyway. Use -e to
+# pass something deliberately.
+ENV_ALLOWLIST = (
+    "HOME", "USER", "LOGNAME", "SHELL", "TERM", "COLORTERM", "LANG", "LC_ALL",
+    "LC_CTYPE", "TZ", "PATH", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE",
+    "DISPLAY", "WAYLAND_DISPLAY", "SSH_TTY", "NO_COLOR", "PAGER", "EDITOR",
+)
+
+# ~/.claude is shared read-write because a session has to write its transcripts,
+# todos and token refreshes there. These entries are the exception: they are
+# executed by the *host's* claude on its next run, so leaving them writable hands
+# any session a way out of the sandbox -- write a hook into settings.json or an
+# mcpServers entry into .claude.json and it runs as the user, unsandboxed, with
+# no prompt. They are mounted read-only on top of the share.
+CLAUDE_CONFIG_RO = (
+    "settings.json", "settings.local.json",
+    "agents", "commands", "plugins", "hooks", "skills", "output-styles",
+)
+
 PR_SET_PDEATHSIG = 1
 _LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
 
@@ -442,11 +464,20 @@ def _passwd_group_binds() -> list[str]:
     return binds
 
 
+def _claude_json_copy() -> Path:
+    """A per-run copy of ~/.claude.json for the sandbox to scribble on. See
+    CLAUDE_CONFIG_RO for why the original is not handed over."""
+    dst = Path(tempfile.mkdtemp(prefix="claude-isol-cfg-")) / "claude.json"
+    shutil.copy(HOME / ".claude.json", dst)
+    return dst
+
+
 def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
                     resolv: Optional[Path] = None,
                     dev_binds: Optional[list[str]] = None,
                     home_subdirs: tuple[str, ...] = (),
-                    writable_home: bool = False) -> list[str]:
+                    writable_home: bool = False,
+                    env_vars: tuple[str, ...] = ()) -> list[str]:
     """Build the `bwrap` argv for --local mode: a host sandbox that exposes only the
     minimal system dirs read-only, a fresh ephemeral HOME with just the Claude config
     bound in, and the cwd as the single read-write tree. `inner` is the command run
@@ -456,7 +487,21 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
     works on Arch (where /bin /lib /sbin are symlinks into /usr) and on distros where
     they are real directories (some openSUSE layouts).
     """
-    cmd = ["bwrap"]
+    cmd = ["bwrap", "--clearenv"]
+
+    # --clearenv, then an allowlist. Without it bwrap forwards our whole environ,
+    # which quietly defeats the scoped gh/git credentials: GH_TOKEN, GITHUB_TOKEN,
+    # ANTHROPIC_API_KEY, AWS_*, GIT_ASKPASS and friends would walk straight into
+    # the sandbox. Anything else the caller actually wants is what -e is for.
+    for var in ENV_ALLOWLIST:
+        val = os.environ.get(var)
+        if val is not None:
+            cmd += ["--setenv", var, val]
+    for spec in env_vars or ():
+        name, _, val = spec.partition("=")
+        val = val if "=" in spec else os.environ.get(name)
+        if val is not None:
+            cmd += ["--setenv", name, val]
 
     # Read-only system dirs that always live at a fixed path when present.
     for d in ("/usr", "/etc", "/opt", "/usr/local"):
@@ -487,7 +532,10 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
     cmd += [
         "--tmpfs", home,
         "--bind", f"{HOME}/.claude", f"{home}/.claude",
-        "--bind", f"{HOME}/.claude.json", f"{home}/.claude.json",
+        # A throwaway copy, not the host file: ~/.claude.json carries mcpServers,
+        # which the host's claude would launch on its next run. The session can
+        # write this freely; nothing it writes reaches the host.
+        "--bind", str(_claude_json_copy()), f"{home}/.claude.json",
         "--bind", f"{HOME}/.config/gh-claude", f"{home}/.config/gh",
         "--bind", f"{HOME}/.gitconfig-claude", f"{home}/.gitconfig",
     ]
@@ -516,6 +564,14 @@ def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
             if not any(d == p or d.startswith(p + "/")
                        for p in ("/usr", "/opt", "/bin", "/sbin")):
                 cmd += ["--ro-bind", d, d]
+
+    # Read-only on top of the writable ~/.claude bind: the entries the host's own
+    # claude would execute later (see CLAUDE_CONFIG_RO). Last-wins ordering, so
+    # these have to come after the bind above.
+    for name in CLAUDE_CONFIG_RO:
+        src = HOME / ".claude" / name
+        if src.exists():
+            cmd += ["--ro-bind", str(src), f"{home}/.claude/{name}"]
 
     # The one read-write tree. Placed after the tmpfs home so a cwd under HOME
     # still wins by bwrap's last-wins ordering.

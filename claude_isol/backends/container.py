@@ -9,7 +9,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-from ..claude_isol import (DEFAULT_IMAGE, HOME, PUBLIC_DNS, confirm_cwd_submounts,
+from ..claude_isol import (CLAUDE_CONFIG_RO, DEFAULT_IMAGE, HOME, PUBLIC_DNS,
+                           confirm_cwd_submounts,
                            ensure_image, find_ide_lock, hostexec_wiring, image_id,
                            install_claude_on_top, notify_wiring, resolve_prompt,
                            setup_nolan_cgroup, spawn_proxy, stdin_from_text)
@@ -70,6 +71,20 @@ def launch(spec: Launch) -> None:
 
     gitconfig = HOME / ".gitconfig-claude"
     gitconfig.touch(exist_ok=True)
+
+    # The parts of ~/.claude the host's claude would execute on its next run are
+    # mounted read-only over the share (see CLAUDE_CONFIG_RO), and ~/.claude.json
+    # -- which carries mcpServers -- is handed over as a throwaway copy rather
+    # than the real file. Without this a session can write itself a hook that runs
+    # unsandboxed on the host the next time claude starts there.
+    config_ro = [
+        arg for name in CLAUDE_CONFIG_RO
+        if (HOME / ".claude" / name).exists()
+        for arg in ("-v", f"{HOME / '.claude' / name}:"
+                          f"{container_home}/.claude/{name}:ro")
+    ]
+    claude_json = Path(tempfile.mkdtemp(prefix="claude-isol-cfg-")) / "claude.json"
+    shutil.copy(HOME / ".claude.json", claude_json)
 
     notify_mounts: list[str] = []
     notify_env: list[str] = []
@@ -136,7 +151,8 @@ def launch(spec: Launch) -> None:
         *home_subdir_flags,
         "-v", f"{HOME}/.claude:{container_home}/.claude",
         *extra_mounts,
-        "-v", f"{HOME}/.claude.json:{container_home}/.claude.json",
+        "-v", f"{claude_json}:{container_home}/.claude.json",
+        *config_ro,
         "-v", f"{gh_config}:{container_home}/.config/gh",
         "-v", f"{gitconfig}:{container_home}/.gitconfig",
         "-v", f"{cwd}:{cwd}",

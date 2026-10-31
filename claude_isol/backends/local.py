@@ -50,4 +50,4 @@ def launch(spec: Launch) -> None:
 
     os.execvp("bwrap", build_bwrap_cmd(spec.cwd, spec.volumes, inner, resolv,
                                        list(spec.dev_binds), spec.home_subdirs,
-                                       spec.tmpfs_home))
+                                       spec.tmpfs_home, spec.env_vars))
