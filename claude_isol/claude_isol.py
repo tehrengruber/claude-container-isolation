@@ -706,6 +706,21 @@ def _validate_volume(ctx, param, value):
     return value
 
 
+def _validate_podman_args(ctx, param, value):
+    """One occurrence, one podman argument, taken exactly as the shell delivered
+    it -- so quoting is handled once, by the shell, and not again here.
+
+    Batching several arguments into one occurrence would need a separator, and
+    both candidates are wrong for podman. Commas are data in its values
+    (`--mount type=bind,source=/a,target=/b`, and the `:rw,exec,mode=1777` this
+    wrapper passes itself); whitespace would quietly cut a path containing a
+    space in half."""
+    for spec in value:
+        if not spec.strip():
+            raise click.BadParameter("empty argument", param=param)
+    return tuple(value)
+
+
 def _validate_home_subdir(ctx, param, value):
     """Normalize --tmpfs-home-subdirectory specs to paths relative to HOME.
 
@@ -792,6 +807,13 @@ def _validate_dev_bind(ctx, param, value):
               help="Take the opening prompt from PATH, so it never appears in a "
                    "command line or in shell history. Fed in on stdin in print "
                    "mode; bound in and passed as an @-reference otherwise.")
+@click.option("--podman-arg", "podman_args", multiple=True, metavar="ARG",
+              callback=_validate_podman_args,
+              help="Pass ARG straight through to `podman run`, for the podman flags "
+                   "this wrapper does not wrap (--memory, --cap-add, --security-opt, "
+                   "...). One argument per occurrence, repeatable: "
+                   "--podman-arg=--memory=4g --podman-arg=--privileged. Use the "
+                   "=form, or the value is taken for an option. Container mode only.")
 @click.option("-v", "--volume", "volumes", multiple=True, metavar="SRC:DST[:OPTS]",
               callback=_validate_volume,
               help="Extra mount, repeatable; works in both modes.")
@@ -803,7 +825,8 @@ def _validate_dev_bind(ctx, param, value):
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
          mount_cwd_recursively, no_lan, exec_cmd, env_vars, tcp_forwards,
-         host_exec, prompt_file, home_subdirs, volumes, dev_binds, claude_args):
+         host_exec, prompt_file, home_subdirs, podman_args, volumes, dev_binds,
+         claude_args):
     """Run Claude Code in isolation.
 
     Unknown options are rejected; pass options through to claude after a `--`
@@ -839,6 +862,9 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         raise click.UsageError("--dev-bind only applies to --local mode")
     if host_exec and local:
         raise click.UsageError("--host-exec only applies to container mode")
+    if podman_args and local:
+        raise click.UsageError("--podman-arg only applies to container mode "
+                               "(--local runs bwrap, not podman)")
 
     # --no-lan creates a per-run cgroup; if our terminal's cgroup isn't delegated
     # (PyCharm/SSH/TTY), re-exec into a delegated scope first. No-op otherwise.
@@ -1014,6 +1040,10 @@ def main(drop_shell, image, install_claude, no_userns, local, tmpfs_home,
         *[arg for var in env_vars for arg in ("-e", var)],
         *notify_env,
         *hostexec_env,
+        # Last of the options, just before the image, so a --podman-arg can override
+        # anything set above it -- and so a stray one lands as a podman flag rather
+        # than as an argument to claude.
+        *podman_args,
         image,
         *(["bash"] if drop_shell else
           list(args) if exec_cmd else

@@ -87,6 +87,8 @@ claude-isol --prompt-file task.md   # opening prompt from a file, so it never
 claude-isol --tmpfs-home-subdirectory .cache,.npm
                                     # writable tmpfs at those paths inside HOME,
                                     # the rest of HOME left as it is
+claude-isol --podman-arg=--memory=4g
+                                    # pass a flag straight to `podman run`
 ```
 
 Unknown options are **rejected** (so a typo'd flag is caught, not silently
@@ -105,6 +107,32 @@ image ships under the home dir is wiped and nothing written there persists; the
 on top, so authentication survives. Under `--local` the home is always a fresh
 tmpfs, and there the flag means something else: it leaves that home **writable**
 instead of read-only (see below).
+
+### Passing flags to podman
+
+Unknown options are rejected, which is deliberate but leaves no room for the many
+`podman run` flags this wrapper doesn't wrap. `--podman-arg` is that room:
+
+```sh
+claude-isol --podman-arg=--memory=4g --podman-arg=--pids-limit=512
+claude-isol --podman-arg=--cap-add --podman-arg=NET_ADMIN
+claude-isol --podman-arg=--mount --podman-arg=type=bind,source=/a,target=/b
+```
+
+One argument per occurrence, repeatable, passed on exactly as the shell delivered
+it — so quoting happens once and nothing here re-interprets the value. That is
+why a flag and a separate value take two occurrences: batching them would need a
+separator, and both candidates break on podman's own syntax, where commas are
+data (`type=bind,source=…`) and a path may contain a space.
+
+Use the `=` form (`--podman-arg=--memory=4g`, not `--podman-arg --memory=4g`) or
+the value is taken for an option of `claude-isol` itself.
+
+The flags are appended after everything the wrapper sets and just before the
+image name, so they win where podman takes the last value — which also means they
+can undo the isolation (`--privileged`, `-v /:/host`, `--network=host`). That is
+the point of an escape hatch; nothing checks what you pass. Container mode only,
+since `--local` runs bwrap rather than podman.
 
 ### Writable paths inside HOME
 
