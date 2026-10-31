@@ -249,7 +249,7 @@ rebuilt only when the image changes.
 
 | share | host | guest |
 | --- | --- | --- |
-| `cwd` | the working directory | `/work`, the one read-write tree |
+| `cwd` | the working directory | the same path as on the host, and where the session starts |
 | `claude` | `~/.claude` | `/root/.claude` |
 | `cfg` | a per-run staging dir | `/run/cfg`, read-only; the guest copies out of it |
 | `vol<n>` | each `-v` source | wherever that `-v` asked for |

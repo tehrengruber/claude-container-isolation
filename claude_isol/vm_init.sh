@@ -29,8 +29,16 @@ mount_tag() {  # mount_tag <virtiofs tag> <mount point> [mount options]
     fi
 }
 
-mount_tag cwd /work
+# cfg first: it carries the path to mount the working directory at.
 mount_tag cfg /run/cfg ro
+
+# The cwd goes where it lives on the host, not somewhere of our choosing, so
+# absolute paths mean the same thing inside and out -- and so claude's project
+# history lands under the same key as a session run outside the VM. /work is
+# only the fallback.
+WORK=/work
+[ -r /run/cfg/cwd ] && WORK="$(cat /run/cfg/cwd)"
+mount_tag cwd "$WORK"
 mount_tag claude /root/.claude
 
 mkdir -p /root/.config/gh
@@ -67,5 +75,9 @@ if [ -r /run/cfg/mounts ]; then
         fi
     done < /run/cfg/mounts
 fi
+
+# ssh runs a command from the user's home, so without this claude would start in
+# /root with the project mounted somewhere it never looks.
+cd "$WORK" || die "cannot enter $WORK"
 
 exec "$@"

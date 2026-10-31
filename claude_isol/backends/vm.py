@@ -31,7 +31,8 @@ that holds only what the daemon needs plus its own share.
 
 Filesystem (see vm_init.sh for the guest half):
 
-    cwd     $PWD            -> /work, the one read-write tree
+    cwd     $PWD            -> the same path it has on the host, and the
+                               session's working directory; the one rw tree
     claude  ~/.claude       -> /root/.claude, with CLAUDE_CONFIG_RO pinned ro
     cfg     a per-run dir   -> /run/cfg, read-only; the guest copies out of it
     vol<n>  each -v source  -> wherever that -v asked for
@@ -550,6 +551,9 @@ def launch(spec: Launch) -> None:
     stage = _config_share(run_dir)
     token = secrets.token_hex(16)
     (stage / "handshake").write_text(token)
+    # Where the guest should mount the working directory, and start in: the same
+    # path it has out here, as in the other two modes.
+    (stage / "cwd").write_text(str(spec.cwd))
     _stage_resolv(stage)
     volume_plan = _stage_volumes(spec.volumes, stage)
 
