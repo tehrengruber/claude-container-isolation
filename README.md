@@ -33,17 +33,21 @@ container, with an MCP-filtering proxy in front of the JetBrains IDE link.
 | --- | --- |
 | `claude_isol/claude_isol.py` | Entry point. Spawns the proxy (if needed) and exec's `podman run`. |
 | `claude_isol/mcp_proxy.py` | Filtering WebSocket proxy in front of the IDE's MCP endpoint. |
-| `claude_isol/Dockerfile` | Arch-based image with `claude-code` installed from `arch-pre-built`. |
+| `claude_isol/Dockerfile` | Arch-based image with `claude-code` installed from `arch-pre-built` (x86_64) or npm (arm64). |
 | `claude_isol/notifyd.py` | Host notification daemon (`claude-isol-notifyd`); renders the status board over D-Bus. |
 | `claude_isol/notify_client.py` | In-container hook forwarder that reports session state to the daemon. |
 | `claude_isol/host_execd.py` | Host-side executor for `--host-exec`; prompts, then runs the command. |
 | `claude_isol/host_mcp.py` | In-container MCP server exposing the `mcp__host__run` tool. |
 | `claude_isol/launch.py` | What the CLI collected, and which flags belong to which mode. |
-| `claude_isol/backends/` | One module per mode (`container`, `local`, `vm`), one `launch()` each. |
+| `claude_isol/hostos/` | What differs between Linux (`linux.py`) and macOS (`darwin.py`): the backend for each mode, the flags the OS cannot support, and the Linux-only kernel machinery. |
+| `claude_isol/backends/` | One module per backend, one `launch()` each: `container`, `vm`, and `--local` as `bwrap` (Linux) or `seatbelt` (macOS). |
 | `claude_isol/vm/image.py` | Builds and caches the bootable disk for `--vm` from the container image. |
 | `claude_isol/Dockerfile.vm` | Guest image: the container image plus a kernel, systemd and sshd. |
+| `claude_isol/Dockerfile.archlinuxarm` | arm64 base image, built from the Arch Linux ARM tarball (verified against `archlinuxarm.asc`). |
 | `pyproject.toml` | Python package definition (`pip install` entry point). |
 | `PKGBUILD` | Arch package definition for `claude-isol`. |
+| `Formula/claude-isol.rb` | Homebrew formula. |
+| `tests/` | Smoke tests of the installed command, run by CI on Linux and macOS. |
 
 ## Requirements
 
@@ -53,7 +57,21 @@ container, with an MCP-filtering proxy in front of the JetBrains IDE link.
 - `qemu-base`, `virtiofsd`, `openssh`, `passt`, `bubblewrap` and access to
   `/dev/kvm` (only for `--vm`)
 
+On macOS, container mode needs `podman` with a running `podman machine`, and
+`--local` needs nothing beyond the system's own `sandbox-exec`. See
+[macOS](#macos) for what does and doesn't carry over.
+
 ## Installing
+
+With Homebrew (macOS, or Linux), from this repository's formula:
+
+```sh
+brew tap tehrengruber/claude-isol https://github.com/tehrengruber/claude-container-isolation
+brew install --HEAD claude-isol
+```
+
+The formula builds from the head of `main`, since there is no tagged release
+yet; `brew upgrade --fetch-HEAD claude-isol` picks up new commits.
 
 User-local with pip:
 
@@ -76,7 +94,8 @@ claude-isol "fix the bug"           # run with a prompt
 claude-isol --shell                 # drop into bash inside the container
                                     # (handy for `gh auth login` etc.)
 claude-isol --image NAME            # run a prebuilt image as-is
-claude-isol --local                 # run on the host in a bubblewrap sandbox
+claude-isol --local                 # run on the host in a sandbox (bubblewrap
+                                    # on Linux, Seatbelt on macOS)
 claude-isol --vm                    # run in a QEMU VM: root inside, host behind
                                     # the VM boundary (needs /dev/kvm)
 claude-isol --tmpfs-home            # mount HOME as a fresh tmpfs (ephemeral home;
@@ -338,6 +357,70 @@ scoped credentials).
 
 The JetBrains MCP proxy, host notifications and `--host-exec` are container-only
 and not wired up in `--local` mode.
+
+This is `--local` on Linux; on macOS it is built from Seatbelt instead (see
+below).
+
+## macOS
+
+Container mode and `--local` both run on macOS. `--vm`, `--no-lan`,
+`--host-exec`, `--tcp-forward` and `--dev-bind` don't, and are refused with an
+error that says why.
+
+**Container mode** runs through `podman machine`, so the container lives in
+podman's Linux VM rather than on the Mac's own kernel:
+
+```sh
+brew install podman
+podman machine init && podman machine start
+claude-isol
+```
+
+The working directory has to be somewhere the machine shares in — by default
+your home directory, `/private` and `/var/folders`. The bundled image is built
+for the machine's own architecture. On Apple silicon that is arm64, where the
+official Arch image does not exist, so the first run also builds a base image,
+`claude-isolation-archlinuxarm`, from Arch Linux ARM's root filesystem tarball
+(`Dockerfile.archlinuxarm`; about 800 MB to download, once). The tarball comes
+over plain http, so the build checks its signature against the Arch Linux ARM
+signing key shipped in `archlinuxarm.asc` before unpacking it. The image on top
+skips the x86_64-only `arch-pre-built` repository and the packages that come
+from it (`python310`–`python312`), and installs claude from npm instead.
+Anything that would
+hand the container a way back to the host is off, because none of it can cross
+the VM: a Unix socket bind-mounted in arrives as a dead file, and pasta forwards
+ports to the VM's loopback rather than the Mac's. So there is no JetBrains MCP
+proxy, no host notifications, no `--host-exec` and no `--tcp-forward`.
+
+The containerized claude cannot read the macOS keychain, which is where the
+Mac's own claude keeps its login, so the first container session asks you to
+log in. That login is written to `~/.claude/.credentials.json` and shared by the
+container sessions after it.
+
+**`--local`** runs the Mac's own claude under Seatbelt (`sandbox-exec`, part of
+macOS). Seatbelt can't mount anything, only allow or deny access to the real
+filesystem, so the bubblewrap layout is rebuilt from rules:
+
+- `HOME` is a fresh per-run directory holding links to `~/.claude` and the
+  scoped `gh`/`git` credentials, plus a throwaway copy of `~/.claude.json`. It
+  is read-only (`--tmpfs-home-subdirectory` and `--tmpfs-home` open it up as on
+  Linux), and `TMPDIR` is a fresh per-run directory too.
+- Your real home directory can't be read, except the working directory, the
+  links above, `-v` sources and the claude install.
+- Nothing can be written outside the working directory, `~/.claude`, the scoped
+  credentials, the per-run `TMPDIR`, `/private/tmp`, `/dev` and `-v` sources not
+  marked `ro`. The `~/.claude` entries the host's claude would execute (the
+  same list as on Linux) can't be written even when they don't exist yet.
+- The environment is the same allowlist as on Linux, plus `-e`.
+- Apple events and LaunchServices are blocked, so neither `osascript` nor `open`
+  can start something outside the sandbox, and signals only reach processes
+  inside it.
+- `-v SRC[:ro]` makes `SRC` reachable where it is. Seatbelt can't move a path,
+  so `-v SRC:DST` with a different `DST` is refused.
+
+It is a weaker boundary than bubblewrap: the session shares the host's process
+list, network and IPC, and reaches the same system services, the login keychain
+included.
 
 ## Running on the host (`--host-exec`)
 

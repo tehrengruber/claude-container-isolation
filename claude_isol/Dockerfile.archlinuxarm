@@ -1,0 +1,40 @@
+# Arch Linux base image for arm64 hosts (Apple silicon under podman machine, or
+# an arm64 Linux box), built from Arch Linux ARM's own root filesystem tarball:
+# the official archlinux image exists for amd64 only. Dockerfile builds on top of
+# this, the same way it builds on archlinux:latest elsewhere.
+#
+# The tarball is only served over plain http, so it is checked against its
+# detached signature before anything is unpacked. The signing key ("Arch Linux
+# ARM Build System", 68B3537F39A313B3E574D06777193F152BDBE6A6) ships beside this
+# file rather than coming from a keyserver at build time. The download happens
+# in a throwaway stage so that gpg is needed neither on the host nor in the image.
+FROM docker.io/library/alpine:3.20 AS fetch
+COPY archlinuxarm.asc /tmp/
+RUN apk add --no-cache curl gnupg tar \
+ && cd /tmp \
+ && curl -fsSLO http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz \
+ && curl -fsSLO http://os.archlinuxarm.org/os/ArchLinuxARM-aarch64-latest.tar.gz.sig \
+ && gpg --dearmor < archlinuxarm.asc > archlinuxarm.gpg \
+ && gpgv --keyring ./archlinuxarm.gpg \
+        ArchLinuxARM-aarch64-latest.tar.gz.sig ArchLinuxARM-aarch64-latest.tar.gz \
+ && mkdir /rootfs \
+ && tar -xpzf ArchLinuxARM-aarch64-latest.tar.gz -C /rootfs \
+ && rm ArchLinuxARM-aarch64-latest.tar.gz
+
+FROM scratch AS base
+COPY --from=fetch /rootfs /
+RUN pacman-key --init && pacman-key --populate archlinuxarm
+# pacman's download sandbox needs kernel features a container build lacks.
+RUN sed -i '/^\[options\]/a DisableSandbox' /etc/pacman.conf
+# The tarball is a bootable system; a container has no use for its kernel.
+RUN pacman -Rdd --noconfirm $(pacman -Qq | grep '^linux' | grep -v '^linux-api-headers$') 2>/dev/null || true
+RUN pacman -Syu --noconfirm base-devel git
+# Let makepkg run as root, which is who builds packages in here.
+RUN sed -i '0,/if (( EUID == 0 ))/s/if (( EUID == 0 ))/if false/' /usr/bin/makepkg
+RUN git config --system --add safe.directory '*'
+RUN pacman -Scc --noconfirm && rm -rf /var/log/* /tmp/* /var/cache/pacman/pkg/*
+
+# One layer: the history above carries the full tarball and every file pacman
+# replaced since.
+FROM scratch
+COPY --from=base / /

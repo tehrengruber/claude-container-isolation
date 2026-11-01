@@ -9,15 +9,10 @@ PR_SET_PDEATHSIG arranges for the proxy to be torn down when podman exits.
 """
 from __future__ import annotations
 
-import ctypes
-import ctypes.util
-import grp
 import json
 import os
-import pwd
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -27,23 +22,22 @@ from typing import Optional
 
 import click
 
-from . import backends
+from . import backends, hostos
+# Reached only on Linux: the features using these are refused or gated off on
+# macOS (see hostos/__init__.py).
+from .hostos.linux import (reexec_in_delegated_scope, runtime_dir,
+                           set_parent_death_signal)
 from .launch import Launch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_IMAGE = os.environ.get("CLAUDE_ISO_IMAGE", "claude-isolation:latest")
+# What DEFAULT_IMAGE builds on for arm64 (see Dockerfile.archlinuxarm).
+ARM_BASE_IMAGE = "localhost/claude-isolation-archlinuxarm:latest"
 HOME = Path(os.environ["HOME"])
 
-# --no-lan: the BPF egress filter (drops traffic to private ranges) is attached to
-# a per-run cgroup by a small root-owned helper; DNS is pinned to a public resolver
-# so it survives the LAN block. See bpf/lan_block.bpf.c and bpf/lan_block_load.c.
+# --no-lan pins DNS to a public resolver, so it survives the LAN block (see
+# hostos/linux.py for the filter itself).
 PUBLIC_DNS = ("1.1.1.1", "1.0.0.1")  # Cloudflare
-NOLAN_LOADER_PATHS = (
-    Path("/usr/lib/claude-isol/lan_block_load"),
-    SCRIPT_DIR / "bpf" / "lan_block_load",
-)
-# Set once we have re-exec'd into a delegated scope, to break the re-exec loop.
-NOLAN_SCOPE_ENV = "CLAUDE_ISOL_NOLAN_SCOPE"
 
 # Host-notification wiring (see notifyd.py / notify_client.py). The forwarder and
 # socket are mounted at fixed container paths; the daemon's socket lives under
@@ -63,8 +57,8 @@ HOSTEXEC_DAEMON_SRC = SCRIPT_DIR / "host_execd.py"
 # daemon will run (DIALOG_TIMEOUT + MAX_TIMEOUT in host_execd.py), with room to spare.
 HOSTEXEC_CALL_TIMEOUT_MS = 4_200_000
 
-# What --local forwards into the sandbox. Everything else is dropped (see the
-# --clearenv in build_bwrap_cmd): the point of the scoped gh/git credentials is
+# What --local forwards into the sandbox. Everything else is dropped (by bwrap's
+# --clearenv, or the explicit environment Seatbelt's backend execs with): the point of the scoped gh/git credentials is
 # that the session never sees the host's real ones, and an exported GH_TOKEN or
 # ANTHROPIC_API_KEY in the launching shell would hand them over anyway. Use -e to
 # pass something deliberately.
@@ -84,46 +78,6 @@ CLAUDE_CONFIG_RO = (
     "settings.json", "settings.local.json",
     "agents", "commands", "plugins", "hooks", "skills", "output-styles",
 )
-
-PR_SET_PDEATHSIG = 1
-_LIBC = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
-
-
-def runtime_dir() -> Path:
-    """`$XDG_RUNTIME_DIR/claude-isol`, checked rather than assumed.
-
-    Private keys, credential copies and the --host-exec socket all live here, on
-    the assumption that it is a directory we own that nobody else can enter. That
-    holds for a logind session; it does not hold if XDG_RUNTIME_DIR is unset and
-    shared, or points into /tmp, where another user could have pre-created the
-    path. mkdir(exist_ok=True) would not notice -- it leaves an existing
-    directory's mode alone and follows a symlink -- so check explicitly.
-    """
-    base = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}")
-    d = base / "claude-isol"
-    d.mkdir(parents=True, exist_ok=True)
-    for p in (base, d):
-        st = p.lstat()
-        if stat.S_ISLNK(st.st_mode):
-            raise click.UsageError(f"{p} is a symlink; refusing to put session "
-                                   "state behind it")
-        if st.st_uid != os.getuid():
-            raise click.UsageError(f"{p} is not owned by you (uid {st.st_uid}); "
-                                   "refusing to put session state there")
-        if st.st_mode & 0o077:
-            if p == d:
-                p.chmod(0o700)   # ours to tighten
-            else:
-                raise click.UsageError(
-                    f"{p} is accessible to other users (mode "
-                    f"{stat.S_IMODE(st.st_mode):04o}); refusing to put session "
-                    "state there")
-    return d
-
-
-def set_parent_death_signal(sig: int) -> None:
-    if _LIBC.prctl(PR_SET_PDEATHSIG, sig, 0, 0, 0) != 0:
-        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
 
 
 def find_ide_lock(cwd: Path) -> Optional[Path]:
@@ -278,114 +232,18 @@ def notify_wiring() -> tuple[list[str], list[str], list[str]]:
     return mounts, env, claude_args
 
 
-def _current_cgroup_path() -> Path:
-    """The launcher's own cgroup v2 directory under /sys/fs/cgroup."""
-    for line in Path("/proc/self/cgroup").read_text().splitlines():
-        if line.startswith("0::"):
-            return Path("/sys/fs/cgroup") / line[3:].lstrip("/")
-    raise SystemExit("--no-lan needs cgroup v2 (unified hierarchy)")
-
-
-def _cgroup_is_delegated() -> bool:
-    """True if we may create child cgroups in our current cgroup, i.e. the cgroup
-    directory is delegated to us (writable). Terminals launched via the user systemd
-    manager (e.g. GNOME Terminal's vte-spawn scope) are delegated; bare login session
-    scopes (PyCharm's terminal, SSH, plain TTY) are root-owned and are not."""
-    try:
-        return os.access(_current_cgroup_path(), os.W_OK | os.X_OK)
-    except OSError:
-        return False
-
-
-def reexec_in_delegated_scope() -> None:
-    """--no-lan needs to create a per-run cgroup, which requires a delegated cgroup.
-    When we were started in a non-delegated one (session-N.scope), re-exec the whole
-    invocation under a transient, delegated user scope so our own systemd --user
-    manager places us somewhere we can manage. No-op when already delegated, and
-    guarded by an env var so the re-exec'd copy never loops."""
-    if os.environ.get(NOLAN_SCOPE_ENV) or _cgroup_is_delegated():
-        return
-    systemd_run = shutil.which("systemd-run")
-    if systemd_run is None:
-        raise SystemExit(
-            "--no-lan: this terminal's cgroup is not delegated and systemd-run is "
-            "missing, so the egress filter's cgroup can't be created. Launch from a "
-            "terminal started by your desktop's systemd user manager, or install "
-            "systemd-run.")
-    env = {**os.environ, NOLAN_SCOPE_ENV: "1"}
-    # --scope keeps the command in the foreground on this TTY; Delegate=yes hands us
-    # ownership of the scope's cgroup subtree so setup_nolan_cgroup() can mkdir in it.
-    os.execvpe(systemd_run, [
-        systemd_run, "--user", "--scope", "--quiet", "--property=Delegate=yes",
-        "--", sys.executable, os.path.abspath(sys.argv[0]), *sys.argv[1:],
-    ], env)
-
-
-def _nolan_loader() -> Path:
-    for p in NOLAN_LOADER_PATHS:
-        if p.exists():
-            return p
-    raise SystemExit(
-        "--no-lan: lan_block_load not found; build it with "
-        "`make -C claude_isol/bpf` or install it under /usr/lib/claude-isol")
-
-
-def setup_nolan_cgroup() -> Path:
-    """Create a per-run cgroup and attach the LAN-block BPF filter to it via the
-    capability-bearing loader. Processes placed in this cgroup -- or any
-    descendant -- can reach the internet but not the local networks."""
-    base = _current_cgroup_path()
-    # We exec away after this, so we can't clean up our own cgroup on exit; sweep
-    # empty leftovers from prior runs instead (rmdir only succeeds when unused).
-    for stale in base.glob("claude-isol-nolan-*"):
-        try:
-            stale.rmdir()
-        except OSError:
-            pass
-    run_cg = base / f"claude-isol-nolan-{os.getpid()}"
-    run_cg.mkdir(exist_ok=True)
-    # The loader carries file caps (cap_bpf,cap_net_admin) so no sudo is needed.
-    # Its own stderr (success line, or a precise attach error) passes through.
-    proc = subprocess.run([str(_nolan_loader()), str(run_cg)])
-    if proc.returncode == 127:
-        # Dynamic linker aborted before main(): the loader is built against
-        # libbpf.so but the runtime library isn't installed.
-        raise SystemExit(
-            "--no-lan: the egress-filter loader could not start -- libbpf is not "
-            "installed. Install it (Arch: pacman -S libbpf), or drop --no-lan.")
-    if proc.returncode != 0:
-        raise SystemExit(
-            f"--no-lan: the egress-filter loader failed (exit {proc.returncode}); "
-            "see its error above.")
-    return run_cg
-
-
-def _submounts_under(path: Path) -> list[str]:
-    """Mountpoints nested strictly under `path` in the caller's mount table -- the
-    foreign filesystems (LUKS volumes, nested binds) a recursive bind of `path` would
-    drag into the sandbox."""
-    root = str(path)
-    out = []
-    for line in Path("/proc/self/mountinfo").read_text().splitlines():
-        fields = line.split(" ")
-        if len(fields) > 4:
-            mp = fields[4]  # mount point, may carry octal-escaped chars
-            if mp != root and mp.startswith(root + "/"):
-                out.append(mp)
-    return out
-
-
 def confirm_cwd_submounts(cwd: Path, skip: bool) -> None:
     """The working directory is always bind-mounted recursively: rootless runtimes
     can't create a non-recursive bind of a subtree that contains mounts (the kernel
     locks inherited mounts in a user namespace and rejects detaching from them with
     EINVAL), and overmounting a submount to hide it is bypassable by container-root.
-    So any filesystem mounted under cwd is genuinely exposed to the sandbox. List
+    Seatbelt, for its part, grants a path and everything below it. So any
+    filesystem mounted under cwd is genuinely exposed to the sandbox. List
     those and confirm before exec'ing -- a stderr note would vanish the moment
     claude's full-screen UI repaints. --mount-cwd-recursively skips the prompt."""
     if skip:
         return
-    nested = _submounts_under(cwd)
+    nested = hostos.submounts_under(cwd)
     if not nested:
         return
     click.echo(
@@ -405,105 +263,7 @@ def public_resolv() -> Path:
     return Path(path)
 
 
-def _ca_trust_binds() -> list[str]:
-    """Read-only binds so the CA trust store resolves inside the --local sandbox.
-
-    /etc and /usr are already ro-bound, which covers the usual layouts (Debian and
-    Arch keep certs under /etc + /usr; Fedora under /etc/pki). But some distros store
-    the real certs elsewhere and only symlink into /etc -- notably openSUSE, whose
-    /etc/ssl/certs/*.pem and /etc/ssl/ca-bundle.pem point into /var/lib/ca-certificates.
-    A recursive /etc bind then carries those symlinks in but not their targets, so they
-    dangle and TLS fails with "unable to get local issuer certificate". Resolve the
-    well-known trust anchors -- and the symlinks inside the cert dir -- and bind any
-    real location that lives outside the trees already bound above."""
-    bound = ("/usr", "/etc", "/opt")
-    targets: set[str] = set()
-
-    def consider(path: str) -> None:
-        if not os.path.lexists(path):
-            return
-        real = os.path.realpath(path)
-        if not os.path.exists(real):  # broken symlink on the host: nothing to bind
-            return
-        d = real if os.path.isdir(real) else os.path.dirname(real)
-        if not any(d == b or d.startswith(b + "/") for b in bound):
-            targets.add(d)
-
-    # Bundle files and the cert dir itself (any of these may be a symlink outward).
-    for p in ("/etc/ssl/certs", "/etc/ssl/cert.pem", "/etc/ssl/ca-bundle.pem",
-              "/etc/pki/tls/certs/ca-bundle.crt"):
-        consider(p)
-    # Entries inside the cert dir are commonly per-cert symlinks into an external
-    # tree (openSUSE's /var/lib/ca-certificates/pem); follow each and collect it.
-    certs_dir = Path("/etc/ssl/certs")
-    if certs_dir.is_dir():
-        for entry in certs_dir.iterdir():
-            if entry.is_symlink():
-                consider(str(entry))
-
-    # Drop any target nested under another; binding the ancestor already covers it.
-    minimal = [d for d in targets
-               if not any(d != o and d.startswith(o + "/") for o in targets)]
-    binds: list[str] = []
-    for d in sorted(minimal):
-        binds += ["--ro-bind", d, d]
-    return binds
-
-
-def _nss_file_with_row(src: str, key: int, row: str) -> Optional[Path]:
-    """A temp copy of the colon-separated file `src` with `row` appended -- unless a
-    line already carries numeric id `key` in its third field, in which case the id is
-    already resolvable from the file the /etc bind carries in and we return None."""
-    try:
-        existing = Path(src).read_text()
-    except OSError:
-        existing = ""
-    for line in existing.splitlines():
-        fields = line.split(":")
-        if len(fields) > 2 and fields[2] == str(key):
-            return None
-    fd, path = tempfile.mkstemp(prefix="claude-isol-nss-")
-    with os.fdopen(fd, "w") as fh:
-        fh.write(existing)
-        if existing and not existing.endswith("\n"):
-            fh.write("\n")
-        fh.write(row)
-    return Path(path)
-
-
-def _passwd_group_binds() -> list[str]:
-    """Make the launching user resolvable inside the --local sandbox.
-
-    Directory accounts (LDAP/AD via SSSD/nss) have no row in /etc/passwd or /etc/group
-    -- they're served over an nss socket the sandbox doesn't expose -- so getpwuid()
-    inside fails ("cannot find name for user ID ...") and breaks whoami, git, shell
-    prompt expansion, etc. Copy the host's files and append the current user's/group's
-    row when it's missing, then bind the copies over /etc/{passwd,group}. Placed after
-    the /etc ro-bind so they win by bwrap's last-wins ordering."""
-    binds: list[str] = []
-    try:
-        pw = pwd.getpwuid(os.getuid())
-    except KeyError:
-        pw = None
-    if pw is not None:
-        row = ":".join((pw.pw_name, "x", str(pw.pw_uid), str(pw.pw_gid),
-                        pw.pw_gecos, pw.pw_dir, pw.pw_shell)) + "\n"
-        f = _nss_file_with_row("/etc/passwd", pw.pw_uid, row)
-        if f is not None:
-            binds += ["--ro-bind", str(f), "/etc/passwd"]
-    try:
-        gr = grp.getgrgid(os.getgid())
-    except KeyError:
-        gr = None
-    if gr is not None:
-        row = ":".join((gr.gr_name, "x", str(gr.gr_gid), ",".join(gr.gr_mem))) + "\n"
-        f = _nss_file_with_row("/etc/group", gr.gr_gid, row)
-        if f is not None:
-            binds += ["--ro-bind", str(f), "/etc/group"]
-    return binds
-
-
-def _claude_json_copy() -> Path:
+def claude_json_copy() -> Path:
     """A per-run copy of ~/.claude.json for the sandbox to scribble on. See
     CLAUDE_CONFIG_RO for why the original is not handed over."""
     dst = Path(tempfile.mkdtemp(prefix="claude-isol-cfg-")) / "claude.json"
@@ -511,170 +271,38 @@ def _claude_json_copy() -> Path:
     return dst
 
 
-def build_bwrap_cmd(cwd: Path, volumes: list[str], inner: list[str],
-                    resolv: Optional[Path] = None,
-                    dev_binds: Optional[list[str]] = None,
-                    home_subdirs: tuple[str, ...] = (),
-                    writable_home: bool = False,
-                    env_vars: tuple[str, ...] = ()) -> list[str]:
-    """Build the `bwrap` argv for --local mode: a host sandbox that exposes only the
-    minimal system dirs read-only, a fresh ephemeral HOME with just the Claude config
-    bound in, and the cwd as the single read-write tree. `inner` is the command run
-    inside the sandbox (e.g. `["claude", ...]` or `["bash"]`).
-
-    The system-dir layout is probed at runtime rather than hardcoded so the same logic
-    works on Arch (where /bin /lib /sbin are symlinks into /usr) and on distros where
-    they are real directories (some openSUSE layouts).
-    """
-    cmd = ["bwrap", "--clearenv"]
-
-    # --clearenv, then an allowlist. Without it bwrap forwards our whole environ,
-    # which quietly defeats the scoped gh/git credentials: GH_TOKEN, GITHUB_TOKEN,
-    # ANTHROPIC_API_KEY, AWS_*, GIT_ASKPASS and friends would walk straight into
-    # the sandbox. Anything else the caller actually wants is what -e is for.
-    for var in ENV_ALLOWLIST:
-        val = os.environ.get(var)
-        if val is not None:
-            cmd += ["--setenv", var, val]
-    for spec in env_vars or ():
-        name, _, val = spec.partition("=")
-        val = val if "=" in spec else os.environ.get(name)
-        if val is not None:
-            cmd += ["--setenv", name, val]
-
-    # Read-only system dirs that always live at a fixed path when present.
-    for d in ("/usr", "/etc", "/opt", "/usr/local"):
-        if Path(d).is_dir():
-            cmd += ["--ro-bind", d, d]
-
-    # The usr-merge compatibility entries: recreate symlinks as-is, bind real dirs.
-    for d in ("/bin", "/sbin", "/lib", "/lib64"):
-        p = Path(d)
-        if p.is_symlink():
-            cmd += ["--symlink", os.readlink(d), d]
-        elif p.is_dir():
-            cmd += ["--ro-bind", d, d]
-
-    # CA trust store: bind any trust anchors that live outside the system trees
-    # already bound above (see _ca_trust_binds).
-    cmd += _ca_trust_binds()
-
-    # Make the launching user (a directory account may be absent from /etc/passwd)
-    # resolvable inside the sandbox (see _passwd_group_binds).
-    cmd += _passwd_group_binds()
-
-    cmd += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
-
-    # Fresh ephemeral HOME (writable tmpfs so ~/.cache etc. work), with only the
-    # Claude config and the scoped gh/git credentials bound in.
-    home = str(HOME)
-    cmd += [
-        "--tmpfs", home,
-        "--bind", f"{HOME}/.claude", f"{home}/.claude",
-        # A throwaway copy, not the host file: ~/.claude.json carries mcpServers,
-        # which the host's claude would launch on its next run. The session can
-        # write this freely; nothing it writes reaches the host.
-        "--bind", str(_claude_json_copy()), f"{home}/.claude.json",
-        "--bind", f"{HOME}/.config/gh-claude", f"{home}/.config/gh",
-        "--bind", f"{HOME}/.gitconfig-claude", f"{home}/.gitconfig",
-    ]
-
-    # Writable scratch inside the otherwise read-only HOME (see the --remount-ro at
-    # the end). A bwrap tmpfs comes up owned by the sandbox user, so unlike podman's
-    # it needs no mode of its own.
-    for rel in home_subdirs:
-        cmd += ["--tmpfs", f"{home}/{rel}"]
-
-    # Make sure the claude binary itself is reachable when it lives outside the
-    # system dirs bound above -- an npm-global install under /usr/local, or a
-    # native one under HOME (~/.local/...). Two directories, because the one PATH
-    # found it in and the one it really lives in differ when the PATH entry is a
-    # symlink into a versioned install dir; bind only the target and the symlink
-    # itself is gone with the tmpfs, so PATH no longer resolves.
-    #
-    # After the tmpfs home, and for the same reason as the cwd below: an install
-    # under the home dir bound before it is simply shadowed, and the sandbox comes
-    # up with no claude in it at all ("bwrap: execvp claude: No such file or
-    # directory").
-    claude_bin = shutil.which("claude")
-    if claude_bin:
-        for d in dict.fromkeys((os.path.dirname(claude_bin),
-                                os.path.dirname(os.path.realpath(claude_bin)))):
-            if not any(d == p or d.startswith(p + "/")
-                       for p in ("/usr", "/opt", "/bin", "/sbin")):
-                cmd += ["--ro-bind", d, d]
-
-    # Read-only on top of the writable ~/.claude bind: the entries the host's own
-    # claude would execute later (see CLAUDE_CONFIG_RO). Last-wins ordering, so
-    # these have to come after the bind above.
-    for name in CLAUDE_CONFIG_RO:
-        src = HOME / ".claude" / name
-        if src.exists():
-            cmd += ["--ro-bind", str(src), f"{home}/.claude/{name}"]
-
-    # The one read-write tree. Placed after the tmpfs home so a cwd under HOME
-    # still wins by bwrap's last-wins ordering.
-    cmd += ["--bind", str(cwd), str(cwd)]
-
-    # User -v specs, translated from podman's src:dst[:opts] to bwrap binds.
-    # Placed last so the user can override anything bound above.
-    for spec in volumes:
-        src, dst, opts = parse_volume(spec)
-        flag = "--ro-bind" if "ro" in opts.split(",") else "--bind"
-        cmd += [flag, src, dst]
-
-    # User --dev-bind specs: like -v but mounted with device access, so device nodes
-    # (GPUs at /dev/dri, /dev/bus/usb, ...) actually work -- a plain bind blocks that.
-    # bwrap-only. Placed after -v so a later --dev-bind can override an earlier -v.
-    for spec in dev_binds or []:
-        parts = spec.split(":")
-        src, dst = (parts[0], parts[0]) if len(parts) == 1 else (parts[0], parts[1])
-        cmd += ["--dev-bind", src, dst]
-
-    # Make DNS resolution work inside the sandbox.
-    #
-    # /etc/resolv.conf is usually a symlink (systemd-resolved, NetworkManager, ...)
-    # into /run. The /etc ro-bind above carries the symlink in, but its target lives
-    # under /run, which the sandbox never mounts -- so the symlink dangles and every
-    # lookup fails. We therefore bind a real file at the symlink's *resolved* target;
-    # the symlink (carried in by the /etc ro-bind) then resolves to it. For a plain
-    # /etc/resolv.conf the ro-bind already exposes the real contents, so we only bind
-    # when we have an override to apply.
-    #
-    # The bound file is our public-resolver override under --no-lan (whose resolver
-    # must survive the LAN block), otherwise the host's own resolved resolv.conf.
-    # Placed after the /etc ro-bind so it wins by bwrap's last-wins ordering.
-    etc_resolv = "/etc/resolv.conf"
-    if os.path.islink(etc_resolv):
-        target = os.path.realpath(etc_resolv)
-        src = resolv if resolv is not None else Path(target)
-        cmd += ["--ro-bind", str(src), target]
-    elif resolv is not None:
-        cmd += ["--ro-bind", str(resolv), etc_resolv]
-
-    # HOME read-only, to match container mode, where HOME is the image's root-owned
-    # directory and only the config paths bound over it are writable. Everything
-    # mounted *into* HOME above -- the config binds, the cwd, --tmpfs-home-subdirectory,
-    # a claude install under the home dir -- is a mount of its own and stays writable:
-    # --remount-ro is not recursive. It has to come after all of them, since mounting
-    # anything needs a writable mountpoint, and it makes the mount itself read-only
-    # rather than just the mode bits, so nothing in the sandbox can chmod its way out.
-    if not writable_home:
-        cmd += ["--remount-ro", home]
-
-    cmd += [
-        "--chdir", str(cwd),
-        "--unshare-all", "--share-net", "--die-with-parent",
-        *inner,
-    ]
-    return cmd
-
-
 def ensure_image(image: str) -> None:
     if subprocess.run(["podman", "image", "exists", image]).returncode == 0:
         return
+    base_arg: list[str] = []
+    if _podman_arch() == "arm64":
+        # No official archlinux image for arm64: build one from Arch Linux ARM.
+        ensure_arm_base()
+        base_arg = ["--build-arg", f"BASE={ARM_BASE_IMAGE}"]
     print(f"image {image} not found; building from {SCRIPT_DIR}", file=sys.stderr)
-    subprocess.run(["podman", "build", "-t", image, str(SCRIPT_DIR)], check=True)
+    subprocess.run(["podman", "build", *base_arg, "-t", image, str(SCRIPT_DIR)],
+                   check=True)
+
+
+def _podman_arch() -> str:
+    """The architecture podman builds for -- the podman machine's on macOS, so
+    asked of podman rather than read off this host."""
+    return subprocess.run(["podman", "info", "--format", "{{.Host.Arch}}"],
+                          capture_output=True, text=True,
+                          check=True).stdout.strip()
+
+
+def ensure_arm_base() -> None:
+    """Build the Arch Linux ARM base image (Dockerfile.archlinuxarm) once. Kept
+    under its own tag so a rebuild of the image on top, which happens every time
+    that one goes missing, does not fetch the ~800 MB root filesystem again."""
+    if subprocess.run(["podman", "image", "exists", ARM_BASE_IMAGE]).returncode == 0:
+        return
+    print(f"building {ARM_BASE_IMAGE} from the Arch Linux ARM tarball",
+          file=sys.stderr)
+    subprocess.run(["podman", "build", "-f",
+                    str(SCRIPT_DIR / "Dockerfile.archlinuxarm"),
+                    "-t", ARM_BASE_IMAGE, str(SCRIPT_DIR)], check=True)
 
 
 def image_id(image: str) -> str:
@@ -881,7 +509,8 @@ def _validate_dev_bind(ctx, param, value):
 @click.option("--no-userns", is_flag=True,
               help="Omit --userns entirely (use podman's default; HOME becomes /root).")
 @click.option("--local", is_flag=True,
-              help="Run on the host under a bubblewrap sandbox (no container).")
+              help="Run on the host in a sandbox, no container: bubblewrap on "
+                   "Linux, Seatbelt on macOS.")
 @click.option("--vm", is_flag=True,
               help="Run in a QEMU virtual machine, where claude is root in its own "
                    "kernel and can do anything (nested containers included) while "
@@ -1007,6 +636,7 @@ def main(drop_shell, image, install_claude, no_userns, local, vm, vm_memory,
 
     # --no-lan creates a per-run cgroup; if our terminal's cgroup isn't delegated
     # (PyCharm/SSH/TTY), re-exec into a delegated scope first. No-op otherwise.
+    # Linux-only, as is --no-lan: check_mode_flags() has refused it elsewhere.
     if no_lan:
         reexec_in_delegated_scope()
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""--vm: claude as root in a QEMU virtual machine.
+"""--vm: claude as root in a QEMU virtual machine. Linux only.
 
 The trade this mode makes is more power inside for more protection outside.
 Inside, claude is root in its own kernel: it can run containers in whatever mode
@@ -68,8 +68,9 @@ import click
 
 from ..claude_isol import (CLAUDE_CONFIG_RO, DEFAULT_IMAGE, HOME, PUBLIC_DNS,
                            _prompt_index, confirm_cwd_submounts, ensure_image,
-                           parse_volume, runtime_dir, set_parent_death_signal,
-                           setup_nolan_cgroup, stdin_from_text)
+                           parse_volume, stdin_from_text)
+from ..hostos.linux import (runtime_dir, set_parent_death_signal,
+                            setup_nolan_cgroup)
 from ..launch import Launch
 from ..vm import image as vm_image
 

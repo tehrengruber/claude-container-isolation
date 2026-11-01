@@ -18,5 +18,6 @@ build-backend = "setuptools.build_meta"
 include = ["claude_isol*"]
 
 [tool.setuptools.package-data]
-claude_isol = ["Dockerfile", "Dockerfile.install-claude", "Dockerfile.vm",
+claude_isol = ["Dockerfile", "Dockerfile.archlinuxarm", "archlinuxarm.asc",
+               "Dockerfile.install-claude", "Dockerfile.vm",
                "vm_init.sh", "claude-isol-notifyd.service"]

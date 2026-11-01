@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""The default mode: claude in a rootless podman container."""
+"""The default mode: claude in a rootless podman container.
+
+The same on both host OSes. On macOS podman runs the container inside podman
+machine's VM, which is why everything that reaches back to the host from inside
+is gated on hostos.CONTAINER_SHARES_HOST rather than assumed.
+"""
 from __future__ import annotations
 
 import os
@@ -9,11 +14,13 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+from .. import hostos
 from ..claude_isol import (CLAUDE_CONFIG_RO, DEFAULT_IMAGE, HOME, PUBLIC_DNS,
                            confirm_cwd_submounts,
                            ensure_image, find_ide_lock, hostexec_wiring, image_id,
                            install_claude_on_top, notify_wiring, resolve_prompt,
-                           setup_nolan_cgroup, spawn_proxy, stdin_from_text)
+                           spawn_proxy, stdin_from_text)
+from ..hostos.linux import setup_nolan_cgroup  # --no-lan, which is Linux-only
 from ..launch import Launch
 
 __all__ = ["launch", "image_id"]
@@ -39,7 +46,11 @@ def launch(spec: Launch) -> None:
     else:
         args = spec.args
 
-    ide_lock = (None if (spec.drop_shell or spec.exec_cmd)
+    # The proxy listens on this host's loopback, which the container can only
+    # reach when it shares this kernel; under podman machine pasta would forward
+    # the port to the VM's loopback instead, where nothing answers.
+    ide_lock = (None if (spec.drop_shell or spec.exec_cmd
+                         or not hostos.CONTAINER_SHARES_HOST)
                 else find_ide_lock(cwd))
 
     # Without --userns=keep-id, container uid 0 maps to the host user, so HOME
@@ -89,7 +100,8 @@ def launch(spec: Launch) -> None:
     notify_mounts: list[str] = []
     notify_env: list[str] = []
     notify_args: list[str] = []
-    if not spec.drop_shell and not spec.exec_cmd:
+    # The daemon's socket only works bind-mounted into a container on this kernel.
+    if not spec.drop_shell and not spec.exec_cmd and hostos.CONTAINER_SHARES_HOST:
         notify_mounts, notify_env, notify_args = notify_wiring()
 
     hostexec_mounts: list[str] = []

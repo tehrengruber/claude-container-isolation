@@ -4,6 +4,7 @@
 `claude_isol.py` parses options into a `Launch` and hands it to exactly one
 backend (see `backends/`); nothing else branches on the mode. A new mode means a
 new backend module plus rows in MODE_ONLY -- not another `if` in shared code.
+What the host OS cannot do is declared in the same spirit, in hostos/.
 """
 from __future__ import annotations
 
@@ -12,6 +13,8 @@ from pathlib import Path
 from typing import Optional
 
 import click
+
+from . import hostos
 
 # Flags that only mean something in some modes. Checked in one loop, so an
 # unsupported combination fails the same way everywhere instead of growing its
@@ -35,7 +38,7 @@ FLAG_NAMES = {
     "no_userns": "--no-userns", "tmpfs_home": "--tmpfs-home",
     "tcp_forwards": "--tcp-forward", "podman_args": "--podman-arg",
     "host_exec": "--host-exec", "dev_binds": "--dev-bind",
-    "vm_memory": "--vm-memory", "vm_cpus": "--vm-cpus",
+    "vm_memory": "--vm-memory", "vm_cpus": "--vm-cpus", "no_lan": "--no-lan",
 }
 
 MODE_FLAGS = {"container": "(the default)", "local": "--local", "vm": "--vm"}
@@ -71,7 +74,15 @@ class Launch:
     vm_cpus: Optional[int] = None
 
     def check_mode_flags(self) -> None:
-        """Reject flags that do not apply to the selected mode."""
+        """Reject flags that do not apply to the selected mode, and a mode or
+        flag the host OS has no machinery for (see hostos/)."""
+        if self.mode not in hostos.BACKENDS:
+            raise click.UsageError(
+                f"{MODE_FLAGS[self.mode]} is not available on {hostos.LABEL}")
+        for attr, why in hostos.UNSUPPORTED.items():
+            if getattr(self, attr, None):
+                raise click.UsageError(
+                    f"{FLAG_NAMES[attr]} is not available on {hostos.LABEL}: {why}")
         for attr, modes in MODE_ONLY.items():
             if not getattr(self, attr, None) or self.mode in modes:
                 continue

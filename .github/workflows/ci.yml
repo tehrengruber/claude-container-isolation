@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          # Ubuntu's AppArmor default refuses unprivileged user namespaces,
+          # which is all --local is made of.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Install claude-isol and claude
+        run: |
+          pip install . pytest
+          npm install -g @anthropic-ai/claude-code
+      - run: pytest -v tests
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install claude-isol with Homebrew, from this checkout
+        run: |
+          brew tap-new --no-git local/ci
+          tap="$(brew --repository local/ci)"
+          src="$RUNNER_TEMP/claude-isol.tar.gz"
+          git archive --format=tar.gz --prefix=claude-isol/ -o "$src" HEAD
+          sha="$(shasum -a 256 "$src" | cut -d' ' -f1)"
+          # The formula only builds from git HEAD; give the tap's copy a stable
+          # source pointing at this checkout, so the code under test is what
+          # Homebrew installs.
+          awk -v url="file://$src" -v sha="$sha" '
+            /^  head / { print "  url \"" url "\""; print "  sha256 \"" sha "\""
+                         print "  version \"0.0.0-ci\"" }
+            { print }' Formula/claude-isol.rb > "$tap/Formula/claude-isol.rb"
+          brew install --build-from-source local/ci/claude-isol
+          brew test local/ci/claude-isol
+      - name: Install the test runner and claude
+        run: |
+          python -m pip install pytest
+          npm install -g @anthropic-ai/claude-code
+      - name: Test the Homebrew-installed claude-isol
+        run: |
+          [ "$(command -v claude-isol)" = "$(brew --prefix)/bin/claude-isol" ]
+          python -m pytest -v tests
